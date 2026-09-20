@@ -1,0 +1,11 @@
+# zig build artifacts
+zig/zig-out/
+zig/.zig-cache/
+
+# c build artifacts
+c/run
+c/runq
+c/run.O3
+c/run.Ofast
+c/runq.ofast
+c/*.s
