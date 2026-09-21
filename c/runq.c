@@ -7,6 +7,8 @@
 #include <math.h>
 #include <string.h>
 #include <fcntl.h>
+#include <immintrin.h>
+#include <cpuid.h>
 #if defined _WIN32
     #include "win.h"
 #else
@@ -16,7 +18,6 @@
 
 
 int GS = 0;
-
 
 typedef struct {
   int dim;
@@ -176,7 +177,7 @@ QuantizedTensor *init_quantized_tensors (void **ptr, int n, int size_each) {
 }
 
 
-void mmap_weights(Weights *w, Config *c, void *ptr) {
+void mmap_weights (Weights *w, Config *c, void *ptr) {
   int dim = c->dim;
   int ffndim = c->ffndim;
   int head_size = dim / c->nheads;
@@ -204,7 +205,7 @@ void mmap_weights(Weights *w, Config *c, void *ptr) {
 }
 
 
-void read_checkpoint(char *path, Config *c, Weights *w, int *fd, float **data, ssize_t *fsize) {
+void read_checkpoint (char *path, Config *c, Weights *w, int *fd, float **data, ssize_t *fsize) {
   FILE *f = fopen(path, "rb");
   if (!f) { mexit("Can't open file"); }
   uint32_t magic_number;
@@ -247,13 +248,13 @@ void read_checkpoint(char *path, Config *c, Weights *w, int *fd, float **data, s
 }
 
 
-void build_transformer(Transformer *tr, char *path) {
+void build_transformer (Transformer *tr, char *path) {
   read_checkpoint(path, &tr->c, &tr->w, &tr->fd, &tr->data, &tr->fsize);
   malloc_state(&tr->s, &tr->c);
 }
 
 
-void  free_transformer(Transformer *tr) {
+void  free_transformer (Transformer *tr) {
   free(tr->w.q_tokens);
   free(tr->w.embeddings);
   free(tr->w.wq);
@@ -273,7 +274,7 @@ void  free_transformer(Transformer *tr) {
 }
 
 
-void rmsnorm(float *o, float *x, float *w, int size) {
+void rmsnorm (float *o, float *x, float *w, int size) {
   float ss = 0.0f;
   for (int i=0; i<size; i++) {
     ss += x[i] * x[i];
@@ -287,7 +288,7 @@ void rmsnorm(float *o, float *x, float *w, int size) {
 }
 
 
-void softmax(float *x, int size) {
+void softmax (float *x, int size) {
   float maxv = x[0];
   for (int i=1; i<size; i++) {
     if (x[i] > maxv) {
@@ -305,23 +306,136 @@ void softmax(float *x, int size) {
 }
 
 
-void matmul(float *o, QuantizedTensor *w, QuantizedTensor *x, int n, int d) {
-  for (int i=0; i<d; i++) {
+// AVX2 int8 GEMV kernel for runq.c, plus dispatch wrapper + scalar baseline.
+//
+// matmul(o, w, x, n, d):  o[i] = sum_j w[i*n+j] * x[j]   (dequantized)
+//   w: QuantizedTensor  q (n*d int8), s (d*(n/GS) float scales, row-major)
+//   x: QuantizedTensor  q (n int8),   s (n/GS float scales)
+//   dequant: o[i] = sum_{g} (int) (sum_{k=0}^{GS-1} w->q[i*n+j+k]*x->q[j+k])
+//                        * w->s[(i*n+j)/GS] * x->s[j/GS]
+//
+// AVX2 kernel (matmul_avx2_impl), per output row i, one quantization group of
+// GS==32 elements at a time:
+//   - load 32 int8 of w(row i) and 32 int8 of x (two 128-bit loads each)
+//   - sign-extend to 16 int16 each (vpunpcklbw/vpunpckhbw via _mm256_cvtepi8_epi16)
+//   - P = vpmaddwd: 8 int32, lane k = W[2k]*X[2k] + W[2k+1]*X[2k+1]
+//     (int8*int8 fits int16 exactly; no overflow)
+//   - exact horizontal sum of the 8 int32 -> int32 group sum `iv`
+//     (int32 add is exact & associative, |iv| <= 32*127*127 = 516128 < 2^31)
+//   - v += (float)iv * w->s[...] * x->s[...]   (same float ops/order as scalar)
+//
+// Bit-exact with matmul_scalar when GS==32 (and for any n, trailing handled).
+// Compiled with plain -O3/-Ofast (no -mavx2 needed): the kernel carries
+// __attribute__((target("avx2"))); dispatch checks CPUID at runtime AND that
+// GS==32, and RUNQ_KERNEL=scalar|avx2 (default avx2) can force the scalar path.
+
+// ---------------------------------------------------------------- scalar -----
+static void matmul_scalar (float *o, QuantizedTensor *w, QuantizedTensor *x, int n, int d) {
+  for (int i = 0; i < d; i++) {
     float v = 0.0f;
-    for (int j=0; j<n; j+=GS) {
+    for (int j = 0; j < n; j += GS) {
       int32_t iv = 0;
-      int in = i*n;
-      for (int k=0; k<GS; k++) {
-        iv += (int32_t)w->q[in+j+k] * (int32_t)x->q[j+k];
+      int in = i * n;
+      for (int k = 0; k < GS; k++) {
+        iv += (int32_t)w->q[in + j + k] * (int32_t)x->q[j + k];
       }
-      v += ((float)iv) * w->s[(in+j)/GS] * x->s[j/GS];
+      v += ((float)iv) * w->s[(in + j) / GS] * x->s[j / GS];
     }
     o[i] = v;
   }
 }
 
+// ------------------------------------------------------------------ avx2 -----
+static void __attribute__((target("avx2")))
+matmul_avx2_impl (float *o, QuantizedTensor *w, QuantizedTensor *x, int n, int d) {
+  const int8_t *wq = w->q;
+  const int8_t *xq = x->q;
+  const float *ws = w->s;
+  const float *xs = x->s;
+  const int G = GS; // assumed 32 (checked in dispatch)
+  for (int i = 0; i < d; i++) {
+    const int8_t *wrow = wq + (size_t)i * n;
+    // 4-lane float accumulator: one vector add per 4 groups (4-way ILP), and a
+    // single int32->float conversion per 4 groups.
+    __m128 acc = _mm_setzero_ps();
+    int j = 0;
+    for (; j + 4 * G <= n; j += 4 * G) {
+      int32_t s[4];
+      for (int g = 0; g < 4; g++) {
+        int jg = j + g * G;
+        __m128i wl = _mm_loadu_si128((const __m128i *)(wrow + jg));
+        __m128i wh = _mm_loadu_si128((const __m128i *)(wrow + jg + 16));
+        __m128i xl = _mm_loadu_si128((const __m128i *)(xq + jg));
+        __m128i xh = _mm_loadu_si128((const __m128i *)(xq + jg + 16));
+        __m256i Wl = _mm256_cvtepi8_epi16(wl);
+        __m256i Wh = _mm256_cvtepi8_epi16(wh);
+        __m256i Xl = _mm256_cvtepi8_epi16(xl);
+        __m256i Xh = _mm256_cvtepi8_epi16(xh);
+        __m256i Pl = _mm256_madd_epi16(Wl, Xl); // 8 int32 (16 prods, elems 0..15)
+        __m256i Ph = _mm256_madd_epi16(Wh, Xh); // 8 int32 (16 prods, elems 16..31)
+        __m256i P  = _mm256_add_epi32(Pl, Ph);  // 16 int32 (all 32 prods, exact)
+        // exact horizontal sum of each 128-bit lane (4 int32) to its scalar sum.
+        // Note: _MM_SHUFFLE(a,b,c,d) places src[d] into dst[0], src[c]->dst[1], etc.
+        //   S[0]=P0+P3, S[1]=P1+P2, S[2]=P2+P0, S[3]=P3+P1  (per 128-bit lane)
+        //   U[0]=S[0]+S[1]=P0+P1+P2+P3  (verified against a concrete [1,2,3,4] case)
+        __m256i S = _mm256_add_epi32(P, _mm256_shuffle_epi32(P, _MM_SHUFFLE(1, 0, 3, 2)));
+        __m256i U = _mm256_add_epi32(S, _mm256_shuffle_epi32(S, _MM_SHUFFLE(3, 3, 3, 3)));
+        int32_t lo = _mm_extract_epi32(_mm256_castsi256_si128(U), 0);   // sum of 16 prods (elems 0..15)
+        int32_t hi = _mm_extract_epi32(_mm256_extracti128_si256(U, 1), 0); // sum of 16 prods (elems 16..31)
+        s[g] = lo + hi; // exact sum of all 32 products in group g
+      }
+      // 4 group int32 sums -> 4 float, one vector multiply-accumulate
+      __m128i si = _mm_set_epi32(s[3], s[2], s[1], s[0]);
+      __m128 fv = _mm_cvtepi32_ps(si); // 4 int32 -> 4 float (vcvtdq2ps)
+      __m128 wsv = _mm_loadu_ps(ws + (i * n + j) / G); // 4 w scales
+      __m128 xsv = _mm_loadu_ps(xs + j / G);           // 4 x scales
+      acc = _mm_add_ps(acc, _mm_mul_ps(_mm_mul_ps(fv, wsv), xsv));
+    }
+    // horizontal-sum the 4-lane float accumulator.
+    // NOTE: _mm_shuffle_ps uses a DIFFERENT imm encoding than _mm256_shuffle_epi32
+    // (each dst lane can only pick from {a0,a1,b0,b1}), so use a scalar reduce here.
+    float v;
+    {
+      float fv[4];
+      _mm_storeu_ps(fv, acc);
+      v = (fv[0] + fv[1]) + (fv[2] + fv[3]);
+    }
+    // trailing groups after the 4-group batches: continue from the batch loop's
+    // final j (NOT (n/G)*G — that would skip a group when n%4G != 0, e.g. n=288).
+    for (int j2 = j; j2 < n; j2 += G) {
+      int32_t iv = 0;
+      for (int k = 0; k < G; k++) iv += (int32_t)wrow[j2 + k] * (int32_t)xq[j2 + k];
+      v += (float)iv * ws[(i * n + j2) / G] * xs[j2 / G];
+    }
+    o[i] = v;
+  }
+}
 
-float *forward(Transformer *tr, int token, int pos) {
+static void matmul_avx2 (float *o, QuantizedTensor *w, QuantizedTensor *x, int n, int d) {
+  matmul_avx2_impl(o, w, x, n, d);
+}
+
+// --------------------------------------------------------------- dispatch ----
+static int runq_use_avx2 (void) {
+  static int cached = -1;
+  if (cached >= 0) return cached;
+  const char *e = getenv("RUNQ_KERNEL");
+  if (e && strcmp(e, "scalar") == 0) { cached = 0; return 0; }
+  if (GS != 32) { cached = 0; return 0; } // kernel is specialized for GS==32
+  unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+  __cpuid(1, eax, ebx, ecx, edx);
+  int has_avx2 = (ecx & (1u << 5)) != 0; // CPUID(1).ECX[5] = AVX2
+  cached = has_avx2 ? 1 : 0;
+  return cached;
+}
+
+void matmul (float *o, QuantizedTensor *w, QuantizedTensor *x, int n, int d) {
+  if (runq_use_avx2()) matmul_avx2(o, w, x, n, d);
+  else matmul_scalar(o, w, x, n, d);
+}
+
+
+float *forward (Transformer *tr, int token, int pos) {
   Config *c = &tr->c;
   Weights *w = &tr->w;
   State *s = &tr->s;
@@ -431,12 +545,12 @@ typedef struct {
 } Tokenizer;
 
 
-int compare_tokens(const void *a, const void *b) {
+int compare_tokens (const void *a, const void *b) {
   return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
 }
 
 
-void build_tokenizer(Tokenizer *t, char *path, int vocab_size) {
+void build_tokenizer (Tokenizer *t, char *path, int vocab_size) {
   t->vocab_size = vocab_size;
   t->vocab = (char **)malloc(vocab_size * sizeof(char*));
   t->scores = (float*)malloc(vocab_size *sizeof(float));
@@ -462,7 +576,7 @@ void build_tokenizer(Tokenizer *t, char *path, int vocab_size) {
 }
 
 
-void free_tokenizer(Tokenizer *t) {
+void free_tokenizer (Tokenizer *t) {
   for (int i=0; i<t->vocab_size; i++) free(t->vocab[i]);
   free(t->vocab);
   free(t->scores);
@@ -470,7 +584,7 @@ void free_tokenizer(Tokenizer *t) {
 }
 
 
-char *decode(Tokenizer *t, int prev_token, int token) {
+char *decode (Tokenizer *t, int prev_token, int token) {
   char *piece = t->vocab[token];
   if (prev_token == 1 && piece[0] == ' ') piece++;
   unsigned char bytev;
@@ -481,7 +595,7 @@ char *decode(Tokenizer *t, int prev_token, int token) {
 }
 
 
-void safe_printf(char *piece) {
+void safe_printf (char *piece) {
     if (piece == NULL) { return; }
     if (piece[0] == '\0') { return; }
     if (piece[1] == '\0') {
@@ -494,14 +608,14 @@ void safe_printf(char *piece) {
 }
 
 
-int str_lookup(char *str, TokenIndex *sorted, int vocab_size) {
+int str_lookup (char *str, TokenIndex *sorted, int vocab_size) {
   TokenIndex tok = { .str = str };
   TokenIndex *res = bsearch(&tok, sorted, vocab_size, sizeof(TokenIndex), compare_tokens);
   return res != NULL ? res->id : -1;
 }
 
 
-void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *ntokens) {
+void encode (Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *ntokens) {
   if (!text) mexit("cannot encode NULL text");
   if (!t->sorted) {
     t->sorted = malloc(t->vocab_size*sizeof(TokenIndex));
@@ -575,7 +689,7 @@ typedef struct {
 } Sampler;
 
 
-int sample_argmax(float *p, int n) {
+int sample_argmax (float *p, int n) {
   int maxi = 0;
   float maxp = p[0];
   for (int i=1; i<n; i++) {
@@ -588,7 +702,7 @@ int sample_argmax(float *p, int n) {
 }
 
 
-int sample_mult(float *p, int n, float coin) {
+int sample_mult (float *p, int n, float coin) {
   float cdf = 0.0f;
   for (int i=0; i<n; i++) {
     cdf += p[i];
@@ -598,7 +712,7 @@ int sample_mult(float *p, int n, float coin) {
 }
 
 
-int compare(const void *a, const void *b) {
+int compare (const void *a, const void *b) {
   ProbIndex *pa = (ProbIndex*) a;
   ProbIndex *pb = (ProbIndex*) b;
   if (pa->prob > pb->prob) return -1;
@@ -607,7 +721,7 @@ int compare(const void *a, const void *b) {
 }
 
 
-int sample_topp(float *p, int n, float topp, ProbIndex *pi, float coin) {
+int sample_topp (float *p, int n, float topp, ProbIndex *pi, float coin) {
   int n0 = 0;
   const float cutoff = (1.0f-topp) / (n-1);
   for (int i=0; i<n; i++) {
@@ -636,7 +750,7 @@ int sample_topp(float *p, int n, float topp, ProbIndex *pi, float coin) {
 }
 
 
-void build_sampler(Sampler *sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed) {
+void build_sampler (Sampler *sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed) {
   sampler->vocab_size = vocab_size;
   sampler->temperature = temperature;
   sampler->topp = topp;
@@ -645,12 +759,12 @@ void build_sampler(Sampler *sampler, int vocab_size, float temperature, float to
 }
 
 
-void free_sampler(Sampler *sampler) {
+void free_sampler (Sampler *sampler) {
   free(sampler->probindex);
 }
 
 
-unsigned int random_u32(unsigned long long *state) {
+unsigned int random_u32 (unsigned long long *state) {
   *state ^= *state >> 12;
   *state ^= *state << 25;
   *state ^= *state >> 27;
@@ -658,12 +772,12 @@ unsigned int random_u32(unsigned long long *state) {
 }
 
 
-float random_f32(unsigned long long *state) {
+float random_f32 (unsigned long long *state) {
   return (random_u32(state) >> 8) / 16777216.0f;
 }
 
 
-int sample(Sampler *sampler, float *logits) {
+int sample (Sampler *sampler, float *logits) {
   int next;
   if (sampler->temperature == 0.0f) {
     next = sample_argmax(logits, sampler->vocab_size);
@@ -683,14 +797,14 @@ int sample(Sampler *sampler, float *logits) {
 }
 
 
-long time_in_ms() {
+long time_in_ms () {
   struct timespec time;
   clock_gettime(CLOCK_REALTIME, &time);
   return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
 
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
+void generate (Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
   char *empty_prompt = "";
   if (!prompt) prompt = empty_prompt;
   int num_prompt_tokens = 0;
@@ -727,7 +841,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 }
 
 
-int main(int argc, char *argv[]) {
+int main (int argc, char *argv[]) {
   char *checkpoint_path = "stories15M-q8.bin";
   char *tokenizer_path = "tokenizer.bin";
   float temperature = 1.0f;
@@ -735,6 +849,7 @@ int main(int argc, char *argv[]) {
   int steps = 256;
   char *prompt = NULL;
   unsigned long long rng_seed = (unsigned int)time(NULL);
+  if (getenv("RUNQ_SEED")) rng_seed = (unsigned long long)atoll(getenv("RUNQ_SEED"));
   if (argc >= 2) {
     checkpoint_path = argv[1];
   }

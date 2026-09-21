@@ -5,6 +5,8 @@
 #include <time.h>
 #include <math.h>
 #include <string.h>
+#include <immintrin.h>
+#include <cpuid.h>
 #include <fcntl.h>
 #if defined _WIN32
     #include "win.h"
@@ -208,7 +210,11 @@ void softmax(float *x, int size) {
 }
 
 
-void matmul(float *o, float *w, float *x, int n, int d) {
+// ------------------------------------------------------------------ scalar ----
+// o[i] = dot(w + i*n, x, n).  Row-major, x is the (small) vector reused for every
+// row: this is a GEMV.  Bit-exact reference; also the fallback for CPUs without
+// AVX2+FMA.
+static void matmul_scalar(float *o, float *w, float *x, int n, int d) {
   for (int i=0; i<d; i++) {
     float v = 0.0f;
     for(int j=0; j<n; j++) {
@@ -216,6 +222,76 @@ void matmul(float *o, float *w, float *x, int n, int d) {
     }
     o[i] = v;
   }
+}
+
+
+// -------------------------------------------------------------------- avx2 ----
+// AVX2/FMA GEMV.  For each output row, the j inner loop is vectorized in 8-float
+// steps: load 8 floats of the w row and 8 floats of x, accumulate with
+// _mm256_fmadd_ps into a single 256-bit accumulator, then reduce the 8 lanes to
+// a scalar and finish the tail (<8 elems) scalar.
+//
+// FMA folds each pair into one fused multiply-add, so results are NOT bit-exact
+// with matmul_scalar (fma(x,y,z) != x*y+z in general) -- that is fine here (the
+// model samples, it is non-deterministic anyway); relative error stays tiny.
+// Compiled with plain -O3 (no -mavx2 needed): the kernel carries
+// __attribute__((target("avx2","fma"))); the wrapper (below) checks CPUID at
+// runtime and RUN_KERNEL=scalar|avx2 (default avx2) can force the scalar path.
+static void __attribute__((target("avx2,fma")))
+matmul_avx2_impl(float *o, float *w, float *x, int n, int d) {
+  for (int i=0; i<d; i++) {
+    const float *row = w + (size_t)i*n;
+    // 4 independent 256-bit accumulators -> 4-way ILP breaks the FMA latency
+    // chain (one 256-bit FMA per cycle, 4-cycle latency); unroll 32 floats.
+    __m256 a0 = _mm256_setzero_ps();
+    __m256 a1 = _mm256_setzero_ps();
+    __m256 a2 = _mm256_setzero_ps();
+    __m256 a3 = _mm256_setzero_ps();
+    int j = 0;
+    for (; j+32 <= n; j += 32) {
+      a0 = _mm256_fmadd_ps(_mm256_loadu_ps(row+j),      _mm256_loadu_ps(x+j),      a0);
+      a1 = _mm256_fmadd_ps(_mm256_loadu_ps(row+j+8),    _mm256_loadu_ps(x+j+8),    a1);
+      a2 = _mm256_fmadd_ps(_mm256_loadu_ps(row+j+16),   _mm256_loadu_ps(x+j+16),   a2);
+      a3 = _mm256_fmadd_ps(_mm256_loadu_ps(row+j+24),   _mm256_loadu_ps(x+j+24),   a3);
+    }
+    // reduce 4 accumulators (32 lanes) to a scalar.
+    a0 = _mm256_add_ps(a0, a1);
+    a2 = _mm256_add_ps(a2, a3);
+    a0 = _mm256_add_ps(a0, a2);
+    float buf[8];
+    _mm256_storeu_ps(buf, a0);
+    float v = ((buf[0]+buf[1])+(buf[2]+buf[3])) + ((buf[4]+buf[5])+(buf[6]+buf[7]));
+    // trailing <32 elements: finish scalar (n is a multiple of 8 in practice,
+    // so this loop is at most 31 iterations; correct for arbitrary n).
+    for (; j<n; j++) {
+      v += row[j] * x[j];
+    }
+    o[i] = v;
+  }
+}
+
+
+// ------------------------------------------------------------ dispatch --------
+// Cached CPUID check: need both AVX2 (CPUID(1).ECX[5]) and FMA (ECX[8]).
+// RUN_KERNEL=scalar forces the scalar path; avx2 (default) uses the kernel
+// when supported, else falls back to scalar.
+static int run_use_avx2(void) {
+  static int cached = -1;
+  if (cached >= 0) return cached;
+  const char *e = getenv("RUN_KERNEL");
+  if (e && strcmp(e, "scalar") == 0) { cached = 0; return 0; }
+  unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+  __cpuid(1, eax, ebx, ecx, edx);
+  int has_fma  = (ecx & (1u << 8))  != 0; // CPUID(1).ECX[8]  = FMA
+  int has_avx2 = (ecx & (1u << 5))  != 0; // CPUID(1).ECX[5]  = AVX2
+  cached = (has_fma && has_avx2) ? 1 : 0;
+  return cached;
+}
+
+
+void matmul(float *o, float *w, float *x, int n, int d) {
+  if (run_use_avx2()) matmul_avx2_impl(o, w, x, n, d);
+  else matmul_scalar(o, w, x, n, d);
 }
 
 
@@ -626,6 +702,7 @@ int main(int argc, char *argv[]) {
   int steps = 256;
   char *prompt = NULL;
   unsigned long long rng_seed = (unsigned int)time(NULL);
+  if (getenv("RUN_SEED")) rng_seed = (unsigned long long)atoll(getenv("RUN_SEED"));
   if (argc >= 2) {
     checkpoint_path = argv[1];
   }

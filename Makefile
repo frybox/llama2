@@ -10,14 +10,9 @@ c: c/run.c c/runq.c
 
 .PHONY: cfast
 cfast: c/run.c c/runq.c
-	$(CC) -Ofast -o c/run c/run.c -lm
-	$(CC) -Ofast -o c/runq c/runq.c -lm
+	$(CC) -Ofast -march=native -o c/run c/run.c -lm
+	$(CC) -Ofast -march=native -o c/runq c/runq.c -lm
 
-# useful for a debug build, can then e.g. analyze with valgrind, example:
-# $ valgrind --leak-check=full ./run out/model.bin -n 3
-cdebug: c/run.c
-	$(CC) -g -o c/run c/run.c -lm
-	$(CC) -g -o c/runq c/runq.c -lm
 
 .PHONY: zig zigfast
 zig:
