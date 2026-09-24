@@ -14,12 +14,18 @@ cfast: c/run.c c/runq.c
 	$(CC) -Ofast -march=native -o c/runq c/runq.c -lm
 
 
-.PHONY: zig zigfast
-zig:
+.PHONY: zig zigfast run runv
+zig: 
 	cd zig && zig build
 
-zigfast:
+zigfast: 
 	cd zig && zig build -Doptimize=ReleaseFast
+
+run: zigfast
+	zig/zig-out/bin/llama2
+
+runv: zigfast
+	zig/zig-out/bin/llama2v
 
 .PHONY: clean
 clean:
