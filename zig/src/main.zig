@@ -138,6 +138,7 @@ const Tokenizer = struct {
   tokens: [][]u8,
   scores: []f32,
   max_token_len: u32,
+  byte_pieces: [512]u8,
 
   fn fromFile(path: []const u8, vocab_size: usize, allocator: Allocator, io: std.Io) !Self {
     const f = try std.Io.Dir.cwd().openFile(io, path, .{});
@@ -150,6 +151,10 @@ const Tokenizer = struct {
 
   fn init(r: *std.Io.Reader, allocator: Allocator, vocab_size: usize) !Self {
     var tokenizer: Self = undefined;
+    for (0..256) |i| {
+      tokenizer.byte_pieces[i*2] = @intCast(i);
+      tokenizer.byte_pieces[i*2+1] = 0;
+    }
     tokenizer.tokens = try allocator.alloc([]u8, vocab_size);
     tokenizer.scores = try allocator.alloc(f32, vocab_size);
     tokenizer.max_token_len = try r.takeInt(@TypeOf(tokenizer.max_token_len), .little);
@@ -230,6 +235,24 @@ const Tokenizer = struct {
     }
     tokens = try allocator.realloc(tokens, ti);
     return tokens;
+  }
+
+  /// C: char *decode(Tokenizer *t, int prev_token, int token)
+  fn decode(self: *const Self, prev_token: u32, token: u32) []const u8 {
+    var piece: []const u8 = self.tokens[token];
+    if (prev_token == 1 and piece.len > 0 and piece[0] == ' ') piece = piece[1..];
+    if (Self.parseBytePiece(piece)) |bytev| {
+      const off: usize = @as(usize, bytev) * 2;
+      piece = self.byte_pieces[off..off + 1];
+    }
+    return piece;
+  }
+
+  /// C: sscanf(piece, "<0x%02hhX>", &bytev) == 1
+  fn parseBytePiece(piece: []const u8) ?u8 {
+    if (piece.len != 6 or piece[0] != '<' or piece[1] != '0'
+     or piece[2] != 'x' or piece[5] != '>') return null;
+    return std.fmt.parseInt(u8, piece[3..5], 16) catch null;
   }
 };
 
@@ -501,10 +524,8 @@ pub fn main (init: std.process.Init) !void {
     if (next == 1) {
       break;
     }
-    const ch = if (token == 1 and tokenizer.tokens[next][0] == ' ')
-                  tokenizer.tokens[next][1..]
-               else tokenizer.tokens[next];
-    try stdout.print("{s}", .{ch});
+    const piece = tokenizer.decode(@intCast(token), @intCast(next));
+    try stdout.print("{s}", .{piece});
     try stdout.flush();
     token = next;
     if (timer == null) {
