@@ -61,8 +61,6 @@ typedef struct {
   float *h1;
   QuantizedTensor hq;
   float *q;
-  float *kp;
-  float *vp;
   float *attn;
   float *logits;
   float *kcache;
@@ -104,8 +102,6 @@ void malloc_state (State *s, Config *c) {
   s->h1     = calloc(ffndim, sizeof(*s->h1));
   s->hq     = (QuantizedTensor){ .q=calloc(ffndim, sizeof(int8_t)), .s=calloc(ffndim/GS, sizeof(float)) };
   s->q      = calloc(c->dim, sizeof(*s->q));
-  s->kp     = NULL;
-  s->vp     = NULL;
   s->attn   = calloc(c->nheads * c->ncontext, sizeof(*s->attn));
   s->logits = calloc(c->nvocab, sizeof(*s->logits));
   s->kcache = calloc(c->nlayers * c->ncontext * kvdim, sizeof(*s->kcache));
@@ -326,8 +322,9 @@ void softmax (float *x, int size) {
 //
 // Bit-exact with matmul_scalar when GS==32 (and for any n, trailing handled).
 // Compiled with plain -O3/-Ofast (no -mavx2 needed): the kernel carries
-// __attribute__((target("avx2"))); dispatch checks CPUID at runtime AND that
-// GS==32, and RUNQ_KERNEL=scalar|avx2 (default avx2) can force the scalar path.
+// __attribute__((target("avx2"))); dispatch probes CPUID at runtime (see
+// runq_cpu below), requires GS==32, and RUNQ_KERNEL=scalar|avx2|avx512|amx
+// (default: auto) can force a specific kernel.
 
 // ---------------------------------------------------------------- scalar -----
 static void matmul_scalar (float *o, QuantizedTensor *w, QuantizedTensor *x, int n, int d) {
@@ -416,22 +413,114 @@ static void matmul_avx2 (float *o, QuantizedTensor *w, QuantizedTensor *x, int n
 }
 
 // --------------------------------------------------------------- dispatch ----
-static int runq_use_avx2 (void) {
-  static int cached = -1;
-  if (cached >= 0) return cached;
-  const char *e = getenv("RUNQ_KERNEL");
-  if (e && strcmp(e, "scalar") == 0) { cached = 0; return 0; }
-  if (GS != 32) { cached = 0; return 0; } // kernel is specialized for GS==32
+// CPU feature table (x86-64). Everything is probed at RUNTIME via CPUID, so
+// no -mavx2/-mavx512f build flags are needed: each kernel carries
+// __attribute__((target("..."))), and this table only DECIDES which kernel
+// to call.
+//
+//   feature      CPUID leaf:reg[bit]             notes
+//   AVX2         CPUID(7,0).EBX[5]               256-bit integer+float
+//   FMA          CPUID(1).ECX[12]                fused multiply-add
+//   AVX512F      CPUID(7,0).EBX[16]              512-bit vector state (ZMM)
+//   AVX512BW     CPUID(7,0).EBX[30]              512-bit byte/word
+//   AVX512VL     CPUID(7,0).EBX[31]              512-bit instrs on 128/256 regs
+//   AVX512VNNI   CPUID(7,0).ECX[11]              512-bit vdpbusd int8 dot (future)
+//   AMX-TILE     CPUID(7,0).EDX[24]              AMX tile config (future GEMM)
+//   AMX-BF16     CPUID(7,0).EDX[22]              AMX bf16 (future GEMM)
+//   AMX-INT8     CPUID(7,0).EDX[25]              AMX int8 (int8 GEMM, future)
+//
+//   (512-bit int8 GEMV needs F+BW+VL together; an AMX GEMM needs AMX-TILE plus
+//   the element-type feature (AMX-INT8 for int8).  Verified against the Linux
+//   kernel cpufeatures.h, which populates /proc/cpuinfo on this host.)
+//
+// Selection picks the HIGHEST level that is (a) supported by the CPU and
+// (b) has a kernel implemented here:  scalar < avx2 < avx512 < amx.
+// Every vector kernel is specialized for GS==32, so other group sizes fall
+// back to scalar.  Override: RUNQ_KERNEL=scalar|avx2|avx512|amx (forcing a
+// kernel your CPU lacks will crash — that is on you).
+typedef struct {
+  int has_fma;
+  int has_avx2;
+  int has_avx512f;
+  int has_avx512bw;
+  int has_avx512vl;
+  int has_avx512vnni;
+  int has_amx_tile;
+  int has_amx_bf16;
+  int has_amx_int8;
+  int level;        // selected kernel: 0 scalar, 1 avx2, 2 avx512, 3 amx
+  const char *kernel;
+} CpuCaps;
+
+static CpuCaps runq_cpu (void) {
+  static CpuCaps caps;
+  static int done = 0;
+  if (done) return caps;
+  done = 1;
+
   unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+  unsigned int maxid = __get_cpuid_max(0, 0); // max standard CPUID leaf
+
   __cpuid(1, eax, ebx, ecx, edx);
-  int has_avx2 = (ecx & (1u << 5)) != 0; // CPUID(1).ECX[5] = AVX2
-  cached = has_avx2 ? 1 : 0;
-  return cached;
+  caps.has_fma  = (ecx >> 12) & 1;   // CPUID(1).ECX[12] = FMA
+
+  if (maxid >= 7) {
+    __cpuid_count(7, 0, eax, ebx, ecx, edx);
+    caps.has_avx2        = (ebx >> 5)  & 1;   // CPUID(7,0).EBX[5]
+    caps.has_avx512f     = (ebx >> 16) & 1;   // CPUID(7,0).EBX[16]
+    caps.has_avx512bw    = (ebx >> 30) & 1;   // CPUID(7,0).EBX[30]
+    caps.has_avx512vl    = (ebx >> 31) & 1;   // CPUID(7,0).EBX[31]
+    caps.has_avx512vnni  = (ecx >> 11) & 1;   // CPUID(7,0).ECX[11]
+    caps.has_amx_bf16    = (edx >> 22) & 1;   // CPUID(7,0).EDX[22]
+    caps.has_amx_tile    = (edx >> 24) & 1;   // CPUID(7,0).EDX[24]
+    caps.has_amx_int8    = (edx >> 25) & 1;   // CPUID(7,0).EDX[25]
+  }
+
+  // pick highest supported level.  Levels 2 (avx512) and 3 (amx) have no
+  // dedicated kernel yet, so auto-selection caps at the highest IMPLEMENTED
+  // level (RUNQ_KERNEL=avx512|amx can still force it for a CPU that has it).
+  int level = 0;
+  const char *kernel = "scalar";
+  if (caps.has_avx2) { level = 1; kernel = "avx2"; }
+  if (caps.has_avx512f && caps.has_avx512bw && caps.has_avx512vl) { level = 2; kernel = "avx512"; }
+  if (caps.has_amx_tile && (caps.has_amx_bf16 || caps.has_amx_int8)) { level = 3; kernel = "amx"; }
+  if (GS != 32) { level = 0; kernel = "scalar"; } // kernels specialized for GS==32
+
+  const int level_implemented = 1; // avx2 is the highest kernel written so far
+  if (level > level_implemented) { level = level_implemented; kernel = "avx2"; }
+
+  // manual override
+  const char *e = getenv("RUNQ_KERNEL");
+  if (e) {
+    if      (!strcmp(e, "scalar")) { level = 0; kernel = "scalar"; }
+    else if (!strcmp(e, "avx2"))   { level = 1; kernel = "avx2";   }
+    else if (!strcmp(e, "avx512")) { level = 2; kernel = "avx512"; }
+    else if (!strcmp(e, "amx"))    { level = 3; kernel = "amx";    }
+    else fprintf(stderr, "RUNQ_KERNEL: unknown value '%s', ignoring\n", e);
+  }
+  caps.level = level;
+  caps.kernel = kernel;
+  return caps;
+}
+
+static void runq_print_cpu (void) {
+  CpuCaps c = runq_cpu();
+  fprintf(stderr,
+    "cpu: avx2=%d fma=%d avx512f=%d avx512bw=%d avx512vl=%d avx512vnni=%d"
+    " amx_tile=%d amx_bf16=%d amx_int8=%d  -> matmul kernel: %s (GS=%d)\n",
+    c.has_avx2, c.has_fma, c.has_avx512f, c.has_avx512bw, c.has_avx512vl,
+    c.has_avx512vnni, c.has_amx_tile, c.has_amx_bf16, c.has_amx_int8,
+    c.kernel, GS);
 }
 
 void matmul (float *o, QuantizedTensor *w, QuantizedTensor *x, int n, int d) {
-  if (runq_use_avx2()) matmul_avx2(o, w, x, n, d);
-  else matmul_scalar(o, w, x, n, d);
+  CpuCaps c = runq_cpu();
+  switch (c.level) {
+    case 1: matmul_avx2(o, w, x, n, d); break;
+    case 2: matmul_avx2(o, w, x, n, d); break; // TODO: 512-bit kernel (AVX512F+BW+VL)
+    case 3: matmul_avx2(o, w, x, n, d); break; // TODO: AMX tile kernel (AMX-TILE+INT8)
+    default: matmul_scalar(o, w, x, n, d);
+  }
 }
 
 
@@ -454,12 +543,13 @@ float *forward (Transformer *tr, int token, int pos) {
 
     // 1. self-attention sublayer
     rmsnorm(s->x1, x, w->wrmsattn+l*dim, dim);
-    s->kp = s->kcache + loff + pos*kvdim;
-    s->vp = s->vcache + loff + pos*kvdim;
+    float *q = s->q;
+    float *k = s->kcache + loff + pos*kvdim;
+    float *v = s->vcache + loff + pos*kvdim;
     quantize(&s->xq, s->x1, dim);
-    matmul(s->q, w->wq+l, &s->xq, dim, dim);
-    matmul(s->kp, w->wk+l, &s->xq, dim, kvdim);
-    matmul(s->vp, w->wv+l, &s->xq, dim, kvdim);
+    matmul(q, w->wq+l, &s->xq, dim, dim);
+    matmul(k, w->wk+l, &s->xq, dim, kvdim);
+    matmul(v, w->wv+l, &s->xq, dim, kvdim);
 
     for (int i=0; i<dim; i+=2) {
       int hdim = i % hsize;
@@ -467,21 +557,21 @@ float *forward (Transformer *tr, int token, int pos) {
       float val = pos * freq;
       float fcr = cosf(val);
       float fci = sinf(val);
-      float v0 = s->q[i], v1 = s->q[i+1];
-      s->q[i]   = v0*fcr - v1*fci;
-      s->q[i+1] = v0*fci + v1*fcr;
+      float v0 = q[i], v1 = q[i+1];
+      q[i]   = v0*fcr - v1*fci;
+      q[i+1] = v0*fci + v1*fcr;
       if (i < kvdim) {
-        v0 = s->kp[i]; v1 = s->kp[i+1];
-        s->kp[i]   = v0*fcr - v1*fci;
-        s->kp[i+1] = v0*fci + v1*fcr;
+        v0 = k[i]; v1 = k[i+1];
+        k[i]   = v0*fcr - v1*fci;
+        k[i+1] = v0*fci + v1*fcr;
       }
     }
     // 可按h并行处理所有head
     for (int h=0; h<c->nheads; h++) {
-      float *q = s->q + h*hsize;
+      q = s->q + h*hsize;
       float *attn = s->attn + h*c->ncontext;
       for (int t=0; t<=pos; t++) {
-        float *k = s->kcache + loff + t*kvdim + (h/kvmul)*hsize;
+        k = s->kcache + loff + t*kvdim + (h/kvmul)*hsize;
         float score = 0.0f;
         for (int i=0; i<hsize; i++) {
           score += q[i] * k[i];
@@ -492,7 +582,7 @@ float *forward (Transformer *tr, int token, int pos) {
       float *x1 = s->x1 + h*hsize;
       memset(x1, 0, hsize*sizeof(*x1));
       for (int t=0; t<=pos; t++) {
-        float *v = s->vcache + loff + t*kvdim + (h/kvmul)*hsize;
+        v = s->vcache + loff + t*kvdim + (h/kvmul)*hsize;
         for (int i=0; i<hsize; i++) {
           x1[i] += attn[t] * v[i];
         }
@@ -855,6 +945,7 @@ int main (int argc, char *argv[]) {
   }
   Transformer transformer;
   build_transformer(&transformer, checkpoint_path);
+  runq_print_cpu();
   Tokenizer tokenizer;
   build_tokenizer(&tokenizer, tokenizer_path, transformer.c.nvocab);
   Sampler sampler;
