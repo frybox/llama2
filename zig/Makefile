@@ -2,7 +2,7 @@
 # example override to clang: make run CC=clang
 CC = gcc
 
-.PHONY: zig zigfast run runv
+.PHONY: zig zigfast run runv runq runqv
 zig: 
 	zig build
 
@@ -17,6 +17,9 @@ runv:
 
 runq:
 	zig/zig-out/bin/llama2q
+
+runqv:
+	zig/zig-out/bin/llama2qv
 
 .PHONY: clean
 clean:
