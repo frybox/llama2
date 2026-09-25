@@ -10,6 +10,8 @@ c/runqv
 c/run.O3
 c/run.Ofast
 c/runq.ofast
+c/test_matmul
+c/test_fp32
 c/*.s
 
 # gprof output

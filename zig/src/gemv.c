@@ -26,6 +26,7 @@
 // No -mavx2 build flag needed: the kernel carries
 // __attribute__((target("avx2"))), and it is only ever called after a
 // runtime CPUID probe confirmed AVX2 (see mainqv.zig detectCpu).
+//
 #include <stdint.h>
 #include <immintrin.h>
 
@@ -95,4 +96,74 @@ qv_matmul_avx2_impl (float *o, const int8_t *wq, const float *ws,
 void qv_matmul_avx2 (float *o, const int8_t *wq, const float *ws,
                      const int8_t *xq, const float *xs, int n, int d) {
   qv_matmul_avx2_impl(o, wq, ws, xq, xs, n, d);
+}
+
+
+// --------------------------------------------------------------------------
+// AVX512 int8 GEMV kernel (512-bit).  Same contract and same 4-lane float
+// accumulation as qv_matmul_avx2_impl, so the float result is bit-identical
+// to it; only the exact int32 group sum is computed differently: one 512-bit
+// madd (32 int8 -> 32 int16 -> 16 int32 = 32 products) plus one 512-bit
+// horizontal reduce, instead of the avx2 4-load/4-cvt/2-madd/shuffle dance.
+// Needs AVX512F+BW+VL (madd/cvt) + DQ (reduce); carries its own target
+// attribute and is only ever called after detectCpu confirmed the features.
+//
+// The target-feature string must name `evex512` for the compiler that drives
+// this translation unit (zig's clang): without it, the 512-bit intrinsics are
+// rejected with "requires target feature 'evex512'" / "AVX vector
+// return/argument ... without 'evex512' enabled changes the ABI".  GCC has no
+// `evex512` feature name of its own, so branch on the compiler instead of
+// hard-coding one spelling.  (Only zig/build.zig compiles this file today --
+// `grep -rn gemv zig/ Makefile` turns up nothing else -- but the macro keeps a
+// plain `gcc -c src/gemv.c` working too.)
+#if defined(__clang__)
+#define QV_AVX512_TARGET "avx512f,avx512bw,avx512vl,avx512dq,evex512"
+#else
+#define QV_AVX512_TARGET "avx512f,avx512bw,avx512vl,avx512dq"
+#endif
+
+static void __attribute__((target(QV_AVX512_TARGET)))
+qv_matmul_avx512_impl (float *o, const int8_t *wq, const float *ws,
+                      const int8_t *xq, const float *xs, int n, int d) {
+  const int G = 32; // group size (GS); dispatch guarantees 32
+  for (int i = 0; i < d; i++) {
+    const int8_t *wrow = wq + (size_t)i * n;
+    __m128 acc = _mm_setzero_ps();
+    int j = 0;
+    for (; j + 4 * G <= n; j += 4 * G) {
+      int32_t s[4];
+      for (int g = 0; g < 4; g++) {
+        int jg = j + g * G;
+        __m256i wl = _mm256_loadu_si256((const __m256i *)(wrow + jg)); // 32 int8
+        __m256i xl = _mm256_loadu_si256((const __m256i *)(xq + jg));
+        __m512i W = _mm512_cvtepi8_epi16(wl); // 32 int8 -> 32 int16
+        __m512i X = _mm512_cvtepi8_epi16(xl);
+        __m512i P = _mm512_madd_epi16(W, X);  // 16 int32 (all 32 prods, exact)
+        s[g] = _mm512_reduce_add_epi32(P);    // exact int32 group sum
+      }
+      __m128i si = _mm_set_epi32(s[3], s[2], s[1], s[0]);
+      __m128 fv = _mm_cvtepi32_ps(si);
+      __m128 wsv = _mm_loadu_ps(ws + (i * n + j) / G);
+      __m128 xsv = _mm_loadu_ps(xs + j / G);
+      acc = _mm_add_ps(acc, _mm_mul_ps(_mm_mul_ps(fv, wsv), xsv));
+    }
+    float v;
+    {
+      float fv[4];
+      _mm_storeu_ps(fv, acc);
+      v = (fv[0] + fv[1]) + (fv[2] + fv[3]);
+    }
+    for (int j2 = j; j2 < n; j2 += G) {
+      int32_t iv = 0;
+      for (int k = 0; k < G; k++) iv += (int32_t)wrow[j2 + k] * (int32_t)xq[j2 + k];
+      v += (float)iv * ws[(i * n + j2) / G] * xs[j2 / G];
+    }
+    o[i] = v;
+  }
+}
+
+
+void qv_matmul_avx512 (float *o, const int8_t *wq, const float *ws,
+                       const int8_t *xq, const float *xs, int n, int d) {
+  qv_matmul_avx512_impl(o, wq, ws, xq, xs, n, d);
 }

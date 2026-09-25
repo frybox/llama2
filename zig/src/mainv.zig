@@ -102,10 +102,10 @@ const print = std.debug.print;
 
 
 const default_vector_width: usize = std.simd.suggestVectorLength(f32) orelse 4;
-/// 8 f32 lanes = one 256-bit AVX2 register (ymm). Deliberately a literal 8 so
-/// the dot product matches c/run.c's _mm256 kernel; on a CPU narrower than
-/// AVX2 the compiler simply splits each vector into two SSE ops (still correct).
-const dot_vec_width: usize = 8;
+/// 16 f32 lanes = one 512-bit AVX512 register (zmm). Deliberately a literal 16
+/// so the dot product emits native 512-bit FMAs; on a CPU without AVX512F the
+/// compiler simply splits each vector into SSE/AVX2 ops (still correct).
+const dot_vec_width: usize = 16;
 const simd_align = @alignOf(@Vector(default_vector_width, f32));
 const simd_alignment: mem.Alignment = .fromByteUnits(simd_align);
 
@@ -472,25 +472,28 @@ fn matmul (o: []f32, w: []const f32, x:[]const f32) void {
 
 
 // ---------------------------------------------------------------------------
-// vector_dot_product: the SIMD GEMV kernel (compare c/run.c:240-271).
+// vector_dot_product: the SIMD GEMV kernel (compare c/run.c's matmul_avx2_impl,
+// c/run.c:240-271 -- same 4-accumulator structure, here at 512-bit width).
 //
-//   vector width : 8 f32 lanes = one 256-bit AVX2 register (ymm). `dot_vec_width`
-//                  is a literal 8 so the generated code can be read next to C's
-//                  _mm256_* kernel; on a narrower CPU LLVM just splits each
-//                  vector into two SSE ops (still correct, still fast).
-//   accumulators : FOUR independent 8-wide accumulators a0..a3, i.e. 32 floats
+//   vector width : 16 f32 lanes = one 512-bit AVX512 register (zmm). `dot_vec_width`
+//                  is a literal 16 so the generated code is native 512-bit FMAs;
+//                  on a narrower CPU LLVM just splits each vector into two
+//                  256-bit ops (still correct).
+//   accumulators : FOUR independent 16-wide accumulators a0..a3, i.e. 64 floats
 //                  per loop iteration. Why: one @mulAdd has to wait for the
-//                  previous one (vfmadd latency ~4 cycles, throughput 1/cycle),
-//                  so a single accumulator retires at most one FMA per 4 cycles
-//                  - a serial latency chain. Four independent chains let the
-//                  FMA units stay busy and give the load unit four independent
-//                  32-byte loads in flight (memory-level parallelism), which is
-//                  exactly the trick c/run.c uses.
+//                  previous one (vfmadd latency ~4-5 cycles, throughput 1/cycle),
+//                  so a single accumulator retires at most one FMA per latency
+//                  cycles - a serial latency chain. Four independent chains let
+//                  the FMA units stay busy and give the load unit four
+//                  independent 64-byte loads in flight (memory-level
+//                  parallelism), exactly the trick c/run.c's kernel uses.
 //   tail         : the 4 accumulators are folded pairwise ((a0+a1)+(a2+a3)), the
-//                  8 lanes go to one scalar with @reduce(.Add, ...), then any
-//                  remaining <32 floats are done scalar. All lengths in this
-//                  model are multiples of 8, so the scalar tail is dead code
-//                  here (<=31 steps) but keeps the function correct for any n.
+//                  16 lanes go to one scalar with @reduce(.Add, ...), then any
+//                  remaining <64 floats are done vectorised (one 16-wide
+//                  accumulator) and finally scalar. Every GEMV length in this
+//                  model is a multiple of 16 (288, 768, 1024; attn_qk 48), so
+//                  the scalar tail is dead code here, but the function stays
+//                  correct for any n.
 //
 // Measured (i7-9700, 768x288 matrix, best of 200 reps): 28.4 GFLOP/s with 4
 // accumulators vs 22.3 GFLOP/s with 1 accumulator, i.e. 1.27x at kernel level.

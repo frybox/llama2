@@ -25,6 +25,23 @@ crun: c
 	c/runv
 	c/runqv
 
+# alias kept from the old Makefile, where `c` was -O3 and `cfast` was the
+# -Ofast/-march=native build; `c` is now the fastest build, so this is just a
+# name-compatible shortcut for it.
+.PHONY: cfast
+cfast: c
+
+# bit-exactness / near-exactness checks for the GEMV kernels (scalar/avx2/avx512).
+# Both tests carry the kernels as copies of the ones in c/runv.c / c/runqv.c and
+# compare them against the scalar reference; each kernel is only called when the
+# CPU actually supports it, so this also passes on non-AVX512 machines.
+.PHONY: test
+test: c/test_matmul.c c/test_fp32.c
+	$(CC) -O3 -o c/test_matmul c/test_matmul.c -lm
+	$(CC) -O3 -o c/test_fp32 c/test_fp32.c -lm
+	./c/test_matmul
+	./c/test_fp32
+
 .PHONY: z zdebug zrun
 z: 
 	cd zig && zig build -Doptimize=ReleaseFast
@@ -44,5 +61,7 @@ clean:
 	rm -f c/runq
 	rm -f c/runv
 	rm -f c/runqv
+	rm -f c/test_matmul
+	rm -f c/test_fp32
 	rm -rf zig/zig-out
 

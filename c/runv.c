@@ -231,8 +231,9 @@ static void matmul_scalar(float *o, float *w, float *x, int n, int d) {
 // with matmul_scalar (fma(x,y,z) != x*y+z in general) -- that is fine here (the
 // model samples, it is non-deterministic anyway); relative error stays tiny.
 // Compiled with plain -O3 (no -mavx2 needed): the kernel carries
-// __attribute__((target("avx2","fma"))); the wrapper (below) checks CPUID at
-// runtime and RUN_KERNEL=scalar|avx2 (default avx2) can force the scalar path.
+// __attribute__((target("avx2","fma"))); the dispatch (below) checks CPUID at
+// runtime, and RUN_KERNEL=scalar|avx2|avx512 (default: highest supported) can
+// force one of the three levels.
 static void __attribute__((target("avx2,fma")))
 matmul_avx2_impl(float *o, float *w, float *x, int n, int d) {
   for (int i=0; i<d; i++) {
@@ -267,27 +268,84 @@ matmul_avx2_impl(float *o, float *w, float *x, int n, int d) {
 }
 
 
+// ------------------------------------------------------------------ avx512 ----
+// Same 4-accumulator structure as matmul_avx2_impl, but at 512-bit width:
+// four independent 16-lane (zmm) accumulators, 64 floats per iteration.
+// Needs only AVX512F (FMA). Carries its own target attribute; the dispatch
+// checks CPUID before this is ever called.
+static void __attribute__((target("avx512f")))
+matmul_avx512_impl(float *o, float *w, float *x, int n, int d) {
+  for (int i=0; i<d; i++) {
+    const float *row = w + (size_t)i*n;
+    __m512 a0 = _mm512_setzero_ps();
+    __m512 a1 = _mm512_setzero_ps();
+    __m512 a2 = _mm512_setzero_ps();
+    __m512 a3 = _mm512_setzero_ps();
+    int j = 0;
+    for (; j+64 <= n; j += 64) {
+      a0 = _mm512_fmadd_ps(_mm512_loadu_ps(row+j),    _mm512_loadu_ps(x+j),    a0);
+      a1 = _mm512_fmadd_ps(_mm512_loadu_ps(row+j+16), _mm512_loadu_ps(x+j+16), a1);
+      a2 = _mm512_fmadd_ps(_mm512_loadu_ps(row+j+32), _mm512_loadu_ps(x+j+32), a2);
+      a3 = _mm512_fmadd_ps(_mm512_loadu_ps(row+j+48), _mm512_loadu_ps(x+j+48), a3);
+    }
+    // fold the 4 accumulators (64 lanes) to a scalar with a pairwise tree.
+    __m512 a = (a0 + a1) + (a2 + a3);
+    float buf[16];
+    _mm512_storeu_ps(buf, a);
+    float t[8]; for (int k=0;k<8;k++)  t[k] = buf[k] + buf[k+8];
+    float u[4]; for (int k=0;k<4;k++)  u[k] = t[k] + t[k+4];
+    float v = (u[0]+u[1]) + (u[2]+u[3]);
+    for (; j<n; j++) v += row[j] * x[j];
+    o[i] = v;
+  }
+}
+
+
 // ------------------------------------------------------------ dispatch --------
-// Cached CPUID check: need both AVX2 (CPUID(1).ECX[5]) and FMA (ECX[8]).
-// RUN_KERNEL=scalar forces the scalar path; avx2 (default) uses the kernel
-// when supported, else falls back to scalar.
-static int run_use_avx2(void) {
+// Cached CPUID check.  Three kernel levels, lowest first:
+//   0 scalar, 1 avx2 (needs FMA+AVX2), 2 avx512 (needs FMA+AVX2+AVX512F).
+// RUN_KERNEL=scalar|avx2|avx512 can force a level; the default is the highest
+// the CPU supports (avx512 when present).  Forcing a kernel the CPU lacks
+// crashes (the kernels are plain code under a target attribute) -- that is on
+// you, same as in the other runners.
+static int run_kernel_level(void) {
   static int cached = -1;
   if (cached >= 0) return cached;
+  int level = 0;
   const char *e = getenv("RUN_KERNEL");
-  if (e && strcmp(e, "scalar") == 0) { cached = 0; return 0; }
-  unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
-  __cpuid(1, eax, ebx, ecx, edx);
-  int has_fma  = (ecx & (1u << 8))  != 0; // CPUID(1).ECX[8]  = FMA
-  int has_avx2 = (ecx & (1u << 5))  != 0; // CPUID(1).ECX[5]  = AVX2
-  cached = (has_fma && has_avx2) ? 1 : 0;
+  int forced = 0;
+  if (e) {
+    if (strcmp(e, "scalar") == 0)      { level = 0; forced = 1; }
+    else if (strcmp(e, "avx2") == 0)   { level = 1; forced = 1; }
+    else if (strcmp(e, "avx512") == 0) { level = 2; forced = 1; }
+    else fprintf(stderr, "RUN_KERNEL: unknown value '%s', ignoring\n", e);
+  }
+  if (!forced) {
+    // CPUID bits: FMA = (1).ECX[12], AVX2 = (7,0).EBX[5], AVX512F = (7,0).EBX[16].
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+    __cpuid(1, eax, ebx, ecx, edx);
+    int has_fma  = (ecx >> 12) & 1;
+    int has_avx2 = 0, has_avx512f = 0;
+    if (__get_cpuid_max(0, 0) >= 7) {
+      unsigned int e7a = 0, e7b = 0, e7c = 0, e7d = 0;
+      __cpuid_count(7, 0, e7a, e7b, e7c, e7d);
+      has_avx2    = (e7b >> 5)  & 1;
+      has_avx512f = (e7b >> 16) & 1;
+    }
+    if (has_fma && has_avx2) level = 1;
+    if (has_fma && has_avx2 && has_avx512f) level = 2;
+  }
+  cached = level;
   return cached;
 }
 
 
 void matmul(float *o, float *w, float *x, int n, int d) {
-  if (run_use_avx2()) matmul_avx2_impl(o, w, x, n, d);
-  else matmul_scalar(o, w, x, n, d);
+  switch (run_kernel_level()) {
+    case 2: matmul_avx512_impl(o, w, x, n, d); break;
+    case 1: matmul_avx2_impl(o, w, x, n, d); break;
+    default: matmul_scalar(o, w, x, n, d); break;
+  }
 }
 
 

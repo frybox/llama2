@@ -302,7 +302,8 @@ void softmax (float *x, int size) {
 }
 
 
-// AVX2 int8 GEMV kernel for runq.c, plus dispatch wrapper + scalar baseline.
+// AVX2/AVX512 int8 GEMV kernels for runqv.c, plus dispatch wrapper + scalar
+// baseline.
 //
 // matmul(o, w, x, n, d):  o[i] = sum_j w[i*n+j] * x[j]   (dequantized)
 //   w: QuantizedTensor  q (n*d int8), s (d*(n/GS) float scales, row-major)
@@ -414,6 +415,66 @@ static void matmul_avx2 (float *o, QuantizedTensor *w, QuantizedTensor *x, int n
   matmul_avx2_impl(o, w, x, n, d);
 }
 
+// --------------------------------------------------------------- avx512 -----
+// Same contract as matmul_avx2_impl, but each group's EXACT int32 sum is
+// computed with one 512-bit madd (32 int8 -> 32 int16 -> 16 int32 = all 32
+// products) plus one 512-bit horizontal add, so a group costs about half the
+// integer ops of the avx2 path (2 loads + 2 cvt + 1 madd + 1 reduce vs the
+// avx2 4 loads + 4 cvt + 2 madd + 2 shuffles + 2 adds + 2 extracts).
+// The float accumulation (4-lane acc, 4-group batches, same order) is
+// IDENTICAL to matmul_avx2_impl, so the output is bit-identical to it.
+// Needs AVX512F+BW (cvt/madd) + DQ (reduce). Carries its own target attribute;
+// runq_cpu() confirms the features before this is ever called.
+static void __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq")))
+matmul_avx512_impl (float *o, QuantizedTensor *w, QuantizedTensor *x, int n, int d) {
+  const int8_t *wq = w->q;
+  const int8_t *xq = x->q;
+  const float *ws = w->s;
+  const float *xs = x->s;
+  const int G = 32; // GS, guaranteed 32 by dispatch.  A literal (not GS) for the
+  // same reason as in matmul_avx2_impl: /G then folds to shifts, no idiv.
+  for (int i = 0; i < d; i++) {
+    const int8_t *wrow = wq + (size_t)i * n;
+    __m128 acc = _mm_setzero_ps();
+    int j = 0;
+    for (; j + 4 * G <= n; j += 4 * G) {
+      int32_t s[4];
+      for (int g = 0; g < 4; g++) {
+        int jg = j + g * G;
+        __m256i wl = _mm256_loadu_si256((const __m256i *)(wrow + jg)); // 32 int8
+        __m256i xl = _mm256_loadu_si256((const __m256i *)(xq + jg));
+        __m512i W = _mm512_cvtepi8_epi16(wl); // 32 int8 -> 32 int16
+        __m512i X = _mm512_cvtepi8_epi16(xl);
+        __m512i P = _mm512_madd_epi16(W, X);  // 16 int32: all 32 products, exact
+        s[g] = _mm512_reduce_add_epi32(P);    // exact int32 group sum
+      }
+      __m128i si = _mm_set_epi32(s[3], s[2], s[1], s[0]);
+      __m128 fv = _mm_cvtepi32_ps(si);
+      __m128 wsv = _mm_loadu_ps(ws + (i * n + j) / G);
+      __m128 xsv = _mm_loadu_ps(xs + j / G);
+      acc = _mm_add_ps(acc, _mm_mul_ps(_mm_mul_ps(fv, wsv), xsv));
+    }
+    float v;
+    {
+      float fv[4];
+      _mm_storeu_ps(fv, acc);
+      v = (fv[0] + fv[1]) + (fv[2] + fv[3]);
+    }
+    // trailing groups after the 4-group batches: continue from the batch loop's
+    // final j (NOT (n/G)*G -- that would skip a group when n%4G != 0, e.g. n=288).
+    for (int j2 = j; j2 < n; j2 += G) {
+      int32_t iv = 0;
+      for (int k = 0; k < G; k++) iv += (int32_t)wrow[j2 + k] * (int32_t)xq[j2 + k];
+      v += (float)iv * ws[(i * n + j2) / G] * xs[j2 / G];
+    }
+    o[i] = v;
+  }
+}
+
+static void matmul_avx512 (float *o, QuantizedTensor *w, QuantizedTensor *x, int n, int d) {
+  matmul_avx512_impl(o, w, x, n, d);
+}
+
 // --------------------------------------------------------------- dispatch ----
 // CPU feature table (x86-64). Everything is probed at RUNTIME via CPUID, so
 // no -mavx2/-mavx512f build flags are needed: each kernel carries
@@ -426,12 +487,14 @@ static void matmul_avx2 (float *o, QuantizedTensor *w, QuantizedTensor *x, int n
 //   AVX512F      CPUID(7,0).EBX[16]              512-bit vector state (ZMM)
 //   AVX512BW     CPUID(7,0).EBX[30]              512-bit byte/word
 //   AVX512VL     CPUID(7,0).EBX[31]              512-bit instrs on 128/256 regs
+//   AVX512DQ     CPUID(7,0).EBX[17]              512-bit doubleword/misc
 //   AVX512VNNI   CPUID(7,0).ECX[11]              512-bit vdpbusd int8 dot (future)
 //   AMX-TILE     CPUID(7,0).EDX[24]              AMX tile config (future GEMM)
 //   AMX-BF16     CPUID(7,0).EDX[22]              AMX bf16 (future GEMM)
 //   AMX-INT8     CPUID(7,0).EDX[25]              AMX int8 (int8 GEMM, future)
 //
-//   (512-bit int8 GEMV needs F+BW+VL together; an AMX GEMM needs AMX-TILE plus
+//   (512-bit int8 GEMV needs F+BW+VL+DQ together (DQ for
+//   _mm512_reduce_add_epi32); an AMX GEMM needs AMX-TILE plus
 //   the element-type feature (AMX-INT8 for int8).  Verified against the Linux
 //   kernel cpufeatures.h, which populates /proc/cpuinfo on this host.)
 //
@@ -446,6 +509,7 @@ typedef struct {
   int has_avx512f;
   int has_avx512bw;
   int has_avx512vl;
+  int has_avx512dq;
   int has_avx512vnni;
   int has_amx_tile;
   int has_amx_bf16;
@@ -472,24 +536,26 @@ static CpuCaps runq_cpu (void) {
     caps.has_avx512f     = (ebx >> 16) & 1;   // CPUID(7,0).EBX[16]
     caps.has_avx512bw    = (ebx >> 30) & 1;   // CPUID(7,0).EBX[30]
     caps.has_avx512vl    = (ebx >> 31) & 1;   // CPUID(7,0).EBX[31]
+    caps.has_avx512dq    = (ebx >> 17) & 1;   // CPUID(7,0).EBX[17]
     caps.has_avx512vnni  = (ecx >> 11) & 1;   // CPUID(7,0).ECX[11]
     caps.has_amx_bf16    = (edx >> 22) & 1;   // CPUID(7,0).EDX[22]
     caps.has_amx_tile    = (edx >> 24) & 1;   // CPUID(7,0).EDX[24]
     caps.has_amx_int8    = (edx >> 25) & 1;   // CPUID(7,0).EDX[25]
   }
 
-  // pick highest supported level.  Levels 2 (avx512) and 3 (amx) have no
-  // dedicated kernel yet, so auto-selection caps at the highest IMPLEMENTED
-  // level (RUNQ_KERNEL=avx512|amx can still force it for a CPU that has it).
+  // pick highest supported level.  Level 3 (amx) has no dedicated kernel yet,
+  // so auto-selection caps at the highest IMPLEMENTED level (2 = avx512);
+  // RUNQ_KERNEL=amx can still force the (unimplemented -> avx2) level for a
+  // CPU that has it.
   int level = 0;
   const char *kernel = "scalar";
   if (caps.has_avx2) { level = 1; kernel = "avx2"; }
-  if (caps.has_avx512f && caps.has_avx512bw && caps.has_avx512vl) { level = 2; kernel = "avx512"; }
+  if (caps.has_avx512f && caps.has_avx512bw && caps.has_avx512vl && caps.has_avx512dq) { level = 2; kernel = "avx512"; }
   if (caps.has_amx_tile && (caps.has_amx_bf16 || caps.has_amx_int8)) { level = 3; kernel = "amx"; }
   if (GS != 32) { level = 0; kernel = "scalar"; } // kernels specialized for GS==32
 
-  const int level_implemented = 1; // avx2 is the highest kernel written so far
-  if (level > level_implemented) { level = level_implemented; kernel = "avx2"; }
+  const int level_implemented = 2; // avx512 is the highest kernel written so far
+  if (level > level_implemented) { level = level_implemented; kernel = "avx512"; }
 
   // manual override
   const char *e = getenv("RUNQ_KERNEL");
@@ -508,10 +574,10 @@ static CpuCaps runq_cpu (void) {
 static void runq_print_cpu (void) {
   CpuCaps c = runq_cpu();
   fprintf(stderr,
-    "cpu: avx2=%d fma=%d avx512f=%d avx512bw=%d avx512vl=%d avx512vnni=%d"
+    "cpu: avx2=%d fma=%d avx512f=%d avx512bw=%d avx512vl=%d avx512dq=%d avx512vnni=%d"
     " amx_tile=%d amx_bf16=%d amx_int8=%d  -> matmul kernel: %s (GS=%d)\n",
     c.has_avx2, c.has_fma, c.has_avx512f, c.has_avx512bw, c.has_avx512vl,
-    c.has_avx512vnni, c.has_amx_tile, c.has_amx_bf16, c.has_amx_int8,
+    c.has_avx512dq, c.has_avx512vnni, c.has_amx_tile, c.has_amx_bf16, c.has_amx_int8,
     c.kernel, GS);
 }
 
@@ -519,7 +585,7 @@ void matmul (float *o, QuantizedTensor *w, QuantizedTensor *x, int n, int d) {
   CpuCaps c = runq_cpu();
   switch (c.level) {
     case 1: matmul_avx2(o, w, x, n, d); break;
-    case 2: matmul_avx2(o, w, x, n, d); break; // TODO: 512-bit kernel (AVX512F+BW+VL)
+    case 2: matmul_avx512(o, w, x, n, d); break; // 512-bit kernel (AVX512F+BW+VL+DQ)
     case 3: matmul_avx2(o, w, x, n, d); break; // TODO: AMX tile kernel (AMX-TILE+INT8)
     default: matmul_scalar(o, w, x, n, d);
   }

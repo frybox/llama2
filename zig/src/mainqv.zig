@@ -31,6 +31,10 @@ extern fn zig_x86_cpuid(leaf_id: u32, subid: u32, eax: *u32, ebx: *u32, ecx: *u3
 const CpuCaps = struct {
   has_fma: bool,
   has_avx2: bool,
+  has_avx512f: bool,
+  has_avx512bw: bool,
+  has_avx512vl: bool,
+  has_avx512dq: bool,
   level: u32,
   kernel: []const u8,
 };
@@ -44,25 +48,35 @@ fn cpuidAll(leaf: u32, sub: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u32
   return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
 }
 
-var g_cpu: CpuCaps = .{ .has_fma = false, .has_avx2 = false, .level = 0, .kernel = "scalar" };
+var g_cpu: CpuCaps = .{ .has_fma = false, .has_avx2 = false, .has_avx512f = false, .has_avx512bw = false, .has_avx512vl = false, .has_avx512dq = false, .level = 0, .kernel = "scalar" };
 
 fn detectCpu(env: *std.process.Environ.Map) void {
-  var caps = CpuCaps{ .has_fma = false, .has_avx2 = false, .level = 0, .kernel = "scalar" };
+  var caps = CpuCaps{ .has_fma = false, .has_avx2 = false, .has_avx512f = false, .has_avx512bw = false, .has_avx512vl = false, .has_avx512dq = false, .level = 0, .kernel = "scalar" };
   const id1 = cpuidAll(1, 0);
   caps.has_fma = (id1.ecx >> 12) & 1 != 0;        // CPUID(1).ECX[12] = FMA
   const max_leaf = cpuidAll(0, 0).eax;
   if (max_leaf >= 7) {
     const id7 = cpuidAll(7, 0);
-    caps.has_avx2 = (id7.ebx >> 5) & 1 != 0;     // CPUID(7,0).EBX[5] = AVX2
+    caps.has_avx2 = (id7.ebx >> 5) & 1 != 0;      // CPUID(7,0).EBX[5] = AVX2
+    caps.has_avx512f = (id7.ebx >> 16) & 1 != 0;  // CPUID(7,0).EBX[16] = AVX512F
+    caps.has_avx512bw = (id7.ebx >> 30) & 1 != 0; // CPUID(7,0).EBX[30] = AVX512BW
+    caps.has_avx512vl = (id7.ebx >> 31) & 1 != 0; // CPUID(7,0).EBX[31] = AVX512VL
+    caps.has_avx512dq = (id7.ebx >> 17) & 1 != 0; // CPUID(7,0).EBX[17] = AVX512DQ
   }
-  // kernel level selection: 0 scalar < 1 avx2 (8-lane int8 GEMV).
+  // kernel level selection: 0 scalar < 1 avx2 (256-bit int8) < 2 avx512 (512-bit int8).
+  // Level 2 needs FMA (unused here) + AVX512F/BW/VL/DQ; it is only reachable when
+  // the 512-bit kernel is available, else auto-selection stays at the avx2 level.
   var level: u32 = 0;
   var kernel: []const u8 = "scalar";
   if (caps.has_avx2) {
     level = 1;
     kernel = "avx2";
   }
-  if (GS != 32) {                                 // kernel is specialized for GS==32
+  if (caps.has_avx512f and caps.has_avx512bw and caps.has_avx512vl and caps.has_avx512dq) {
+    level = 2;
+    kernel = "avx512";
+  }
+  if (GS != 32) {                                 // kernels are specialized for GS==32
     level = 0;
     kernel = "scalar";
   }
@@ -74,6 +88,9 @@ fn detectCpu(env: *std.process.Environ.Map) void {
     } else if (mem.eql(u8, e, "avx2")) {
       level = 1;
       kernel = "avx2";
+    } else if (mem.eql(u8, e, "avx512")) {
+      level = 2;
+      kernel = "avx512";
     } else {
       std.debug.print("MAINQV_KERNEL: unknown value '{s}', ignoring\n", .{e});
     }
@@ -84,9 +101,13 @@ fn detectCpu(env: *std.process.Environ.Map) void {
 }
 
 fn printCpu() void {
-  std.debug.print("cpu: avx2={d} fma={d}  -> matmul kernel: {s} (GS={d})\n", .{
+  std.debug.print("cpu: avx2={d} fma={d} avx512f={d} avx512bw={d} avx512vl={d} avx512dq={d}  -> matmul kernel: {s} (GS={d})\n", .{
     @as(u8, @intFromBool(g_cpu.has_avx2)),
     @as(u8, @intFromBool(g_cpu.has_fma)),
+    @as(u8, @intFromBool(g_cpu.has_avx512f)),
+    @as(u8, @intFromBool(g_cpu.has_avx512bw)),
+    @as(u8, @intFromBool(g_cpu.has_avx512vl)),
+    @as(u8, @intFromBool(g_cpu.has_avx512dq)),
     g_cpu.kernel,
     GS,
   });
@@ -494,9 +515,14 @@ inline fn vector_exp8 (a: @Vector(exp_vec_width, f32)) @Vector(exp_vec_width, f3
 // ---------------------------------------------------------------------------
 extern fn qv_matmul_avx2 (o: [*]f32, wq: [*]i8, ws: [*]f32, xq: [*]i8,
                           xs: [*]f32, n: c_int, d: c_int) callconv(.c) void;
+extern fn qv_matmul_avx512 (o: [*]f32, wq: [*]i8, ws: [*]f32, xq: [*]i8,
+                            xs: [*]f32, n: c_int, d: c_int) callconv(.c) void;
 
 fn matmul (o: []f32, w: QuantizedTensor, x: QuantizedTensor) void {
-  if (g_cpu.level == 1) {
+  if (g_cpu.level == 2) {
+    qv_matmul_avx512(o.ptr, w.q.ptr, w.s.ptr, x.q.ptr, x.s.ptr,
+      @intCast(x.q.len), @intCast(o.len));
+  } else if (g_cpu.level == 1) {
     qv_matmul_avx2(o.ptr, w.q.ptr, w.s.ptr, x.q.ptr, x.s.ptr,
       @intCast(x.q.len), @intCast(o.len));
   } else {
