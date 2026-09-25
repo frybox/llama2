@@ -25,12 +25,6 @@ crun: c
 	c/runv
 	c/runqv
 
-# alias kept from the old Makefile, where `c` was -O3 and `cfast` was the
-# -Ofast/-march=native build; `c` is now the fastest build, so this is just a
-# name-compatible shortcut for it.
-.PHONY: cfast
-cfast: c
-
 # bit-exactness / near-exactness checks for the GEMV kernels (scalar/avx2/avx512).
 # Both tests carry the kernels as copies of the ones in c/runv.c / c/runqv.c and
 # compare them against the scalar reference; each kernel is only called when the
