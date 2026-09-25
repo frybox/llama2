@@ -349,7 +349,9 @@ matmul_avx2_impl (float *o, QuantizedTensor *w, QuantizedTensor *x, int n, int d
   const int8_t *xq = x->q;
   const float *ws = w->s;
   const float *xs = x->s;
-  const int G = GS; // assumed 32 (checked in dispatch)
+  const int G = 32; // GS, guaranteed 32 by dispatch.  A literal (not GS) so the
+  // compiler folds /G to shifts; as `GS` (a runtime global) gcc emits an idiv
+  // per group index, ~30% slower (measured 510 -> 630 tok/s end-to-end).
   for (int i = 0; i < d; i++) {
     const int8_t *wrow = wq + (size_t)i * n;
     // 4-lane float accumulator: one vector add per 4 groups (4-way ILP), and a
