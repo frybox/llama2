@@ -5,6 +5,8 @@ zig/.zig-cache/
 # c build artifacts
 c/run
 c/runq
+c/runv
+c/runqv
 c/run.O3
 c/run.Ofast
 c/runq.ofast
