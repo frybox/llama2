@@ -15,6 +15,9 @@ run:
 runv:
 	zig/zig-out/bin/llama2v
 
+runq:
+	zig/zig-out/bin/llama2q
+
 .PHONY: clean
 clean:
 	rm -rf zig-out

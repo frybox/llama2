@@ -40,4 +40,22 @@ pub fn build(b: *std.Build) void {
     }
     const run_v_step = b.step("runv", "Run the SIMD app (mainv.zig)");
     run_v_step.dependOn(&run_v_cmd.step);
+
+    // llama2q = same program, but int8_0 quantified embeddings and (attn & ffn) weights
+    const exe_q = b.addExecutable(.{
+        .name = "llama2q",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mainq.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(exe_q);
+    const run_q_cmd = b.addRunArtifact(exe_q);
+    run_q_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_q_cmd.addArgs(args);
+    }
+    const run_q_step = b.step("runq", "Run the quantized app (mainq.zig)");
+    run_q_step.dependOn(&run_q_cmd.step);
 }

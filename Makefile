@@ -27,6 +27,9 @@ run: zigfast
 runv: zigfast
 	zig/zig-out/bin/llama2v
 
+runq: zigfast
+	zig/zig-out/bin/llama2q
+
 .PHONY: clean
 clean:
 	rm -f c/run
