@@ -18,22 +18,81 @@
 //!     root_source_file = b.path("src/mainv.zig")   (artifact name: llama2v)
 //! Nothing here needs a third-party dependency.
 //!
-//! Performance on this machine (Intel i7-9700, pinned CPU, 5 runs, 255 tokens):
+//! Performance on this machine (Intel i7-9700, `taskset -c 3`, 7 interleaved
+//! runs, median, timed over a FIXED 255-token window so the numbers do not
+//! depend on where the first EOS token happens to land):
 //!   zig/src/main.zig   (scalar matmul)     71 tok/s   1.00x
-//!   this file          (SIMD, 4 accum.)   282 tok/s   4.0x   (vs main.zig;
-//!                                                             273-280 unpinned)
-//!   c/run.c            (AVX2+FMA GEMV)    351 tok/s   4.9x   (C is still
-//!                                                             1.24x faster)
-//! Why C is still 1.24x faster: one token streams the whole ~61 MB of weights
-//! out of DRAM, so the model is bandwidth-bound. Instrumented copies (timers
-//! around every matmul call) measure matmul = 2.87 ms/token in this file vs
-//! 2.78 ms/token in c/run.c (only 3% apart), while the non-matmul time is
-//! 0.77 ms vs 0.38 ms/token: nearly the whole gap sits outside the GEMV
-//! (softmax over 32000 logits, top-p sort, rope). The GEMV itself is fine.
+//!   baseline mainv     (SIMD, 4 accum.)   277 tok/s   3.9x   3.6164 ms/token
+//!   this file          (SIMD + 5 fixes)   328 tok/s   4.6x   3.0492 ms/token
+//!   c/run.c  gcc -O3                      321 tok/s           3.1195 ms/token
+//!   c/run.c  gcc -Ofast -march=native     348 tok/s   4.9x   2.8736 ms/token
+//!   this file + A1b+B2+S2 below           340 tok/s   4.8x   2.9412 ms/token
+//!
+//! A later revision of this file added the five fixes below; they only touch the
+//! five places listed, everything else is unchanged. The changes, each measured
+//! in isolation the same way (ms/token saved):
+//!   H1   softmax over the 32000 logits: a scalar std.math.exp per element (an
+//!        out-of-line libm call) -> vector_exp8, 8 lanes at a time     0.385
+//!   H1b  the same vector_exp8 inside swiglu/silu (1152 exps per layer) 0.085
+//!   attn@v in the attention head: explicit 8-lane @Vector + @mulAdd, the
+//!        scalar form was being scalarised by LLVM                    0.117
+//!   rope: the cos/sin angles depend only on (pos, i), so build them once per
+//!        token instead of once per (layer, i)                        0.050
+//!   softmax normalisation: one reciprocal + multiply instead of 32000
+//!        divisions                                                   0.019
+//!   (each row is baseline-minus-that-one-change in the same session, +-0.03
+//!    i.e. the ~1% run spread; they add up to 0.656 against 0.567 for all five
+//!    together, the usual second-order effect of combining them)
+//!   (two further ideas were tested and REJECTED, both measured as zero:
+//!    @setFloatMode(.optimized), and swapping the top-p pdq sort for qsort.
+//!    Neither is in this file. The fast-math rejection was re-confirmed on the
+//!    pristine source with 30 alternating pinned pairs: median delta 0.00
+//!    ms/token, 14/30 wins, against a same-source noise floor of 0.00.)
+//!
+//! The remaining 1.06x gap to `gcc -Ofast` was decomposed with per-stage rdtsc
+//! timers on instrumented twins of both, in the protocol this file actually
+//! runs (temperature 1.0, topp 0.9, no early break): loop_total 3.0007 vs
+//! 2.8741 ms/token. classifier +0.068 is over half of it (288x32000 GEMV, 57%
+//! of the whole token; 21.5 GB/s here against 22.4 in C, and the measured
+//! single-core streaming ceiling for this row shape is 23.9 GB/s), then
+//! softmax_logits +0.033 (the 32000-element exp pass), w1 +0.010, w3 +0.009,
+//! attn_qk +0.007, softmax_attn +0.005, sample_topp +0.004 and the other GEMVs
+//! +0.002..0.004. Offset by rope -0.008, w2 -0.011 (both now faster here) and
+//! temp_div -0.004 because temperature is a compile-time constant 1.0, so the
+//! x/1.0 scaling folds away (a property of main.zig, not of the changes below),
+//! while C pays 32000 divisions. Three fixes were applied on top of that
+//! analysis, each measured in isolation with 24-30 alternating pinned pairs
+//! (the same-source pair is the noise floor and comes out at exactly 0.00):
+//!   A1b  vector_dot_product's tail: n = 48 (attn_qk) used to run one 32-lane
+//!        FMA iteration and then 16 scalar ones, ~22 extra cycles per dot 0.036
+//!   B2   matmul: two weight rows per pass (dot_rows_2), so the row-end
+//!        reduce/shuffle chain of row r hides behind the FMAs of row r+1  0.030
+//!   S2   the 32000-element softmax max scan was a scalar branchy loop; it and
+//!        the exp pass now use four 8-lane accumulators and a 4x unrolled tail
+//!                                                                         0.027
+//! Together (7 interleaved runs, median, same session): 340.0 tok/s = 2.9412
+//! ms/token against c/run.c's 348.8 = 2.8670, i.e. +0.074 ms/token (+2.6%),
+//! which is 30/30 in paired runs; the +6.7% this started from was 327.0 =
+//! 3.0581. What is left is ~76% classifier, and that GEMV already streams
+//! within 10% of the machine's single-core limit. Tested and rejected this
+//! round, all at or below the noise floor: @prefetch on the GEMV weight stream
+//! (7 distances x 2 localities), 3- and 4-row blocking (register pressure),
+//! fully unrolling the n = 288/768 inner loop, and a softmax variant that
+//! branches on the length.
 //! Note that swapping 1 -> 4 accumulators changes nothing end-to-end on this
 //! CPU (no-early-break harness, 15 paired pinned runs: 274.5 vs 274.7 tok/s);
 //! it is kept because it matches c/run.c exactly and does not rely on the
 //! optimiser reassociating a serial FMA chain.
+//!
+//! Also in this file (and in main.zig) is one correctness fix, not a speed one:
+//! the K/V head offset was `h*hsize`, which is only correct when
+//! nheads == nkvheads. It is now `(h/kvmul)*hsize` with kvmul = nheads/nkvheads,
+//! matching c/run.c:305,341,352. For stories15M (6/6) kvmul == 1, so the offsets
+//! are unchanged and the greedy 256-step token ids come out bit-identical to
+//! before; a synthetic nheads=6/nkvheads=2 checkpoint diverges in its very first
+//! sampled token under the old mapping, and under the new one it matches the C
+//! output token for token (that checkpoint also reproduces the 256-step greedy
+//! ids, and pos-0 logits agree with C to within 7.2e-6).
 
 const std = @import("std");
 const mem = std.mem;
@@ -51,14 +110,77 @@ const simd_align = @alignOf(@Vector(default_vector_width, f32));
 const simd_alignment: mem.Alignment = .fromByteUnits(simd_align);
 
 
-comptime {
-  @setFloatMode(.optimized);
-}
-
 /// @Vector is a builtin and cannot be aliased to a const; provide a callable
 /// name so the kernels below can keep reading `Vector(n, f32)`.
 fn Vector (comptime len: usize, comptime T: type) type {
   return @Vector(len, T);
+}
+
+
+/// rope angle table for the position currently being decoded: rope_cos[ii] /
+/// rope_sin[ii] hold cos/sin of `pos * freq(2*ii)` and are filled once per token
+/// by transformer(), then read by every layer. 512 entries cover any head size
+/// this model family uses (dim/2 = 144 here).
+const rope_table_len: usize = 512;
+var rope_cos: [rope_table_len]f32 = undefined;
+var rope_sin: [rope_table_len]f32 = undefined;
+
+/// Width of the exp kernel below: 8 f32 lanes = one 256-bit ymm, the same width
+/// the GEMV uses (dot_vec_width). exp is not part of the GEMV, so it gets its
+/// own name instead of sharing that one.
+const exp_vec_width: usize = 8;
+
+
+// ---------------------------------------------------------------------------
+// vector_exp8: exp() for 8 lanes at once.
+//
+//   why  : softmax over the 32000 logits calls exp() once per element, and the
+//          swiglu activation calls it 4*dim = 1152 times per layer (6 layers).
+//          With the scalar `std.math.exp` every one of those is an out-of-line
+//          libm call, so the vector units sit idle; measured 0.363 ms/token in
+//          softmax + 0.051 ms/token in swiglu on a pinned CPU.
+//   how  : exp(x) = 2^k * 2^r. k = round(x * log2(e)) is split off with @floor
+//          (@floor(t + 0.5) rounds to nearest), the remainder r = x - k*ln2 has
+//          |r| <= ln2/2 = 0.347, and 2^k is assembled straight from the f32
+//          exponent field, ((k + 127) << 23), which is exact for
+//          -126 <= k <= 127. 2^r is the degree-5 truncation of the exp Taylor
+//          series in Horner form: 1 + r + r^2/2 + r^3/6 + r^4/24 + r^5/120.
+//   width: 8 lanes, i.e. one ymm per 8 exponentials; callers with a leftover
+//          tail (< 8 elements) fall back to std.math.exp, so any length works.
+//   error: max relative error 3.25e-6 over a dense sweep of the real input
+//          domain (x in [-120, 0], step 7e-4; 79.8% of those points stay below
+//          5e-7), dominated by the dropped r^6/720 term (0.347^6/720 = 2.4e-6).
+//          Measured by expcheck.zig, which compiles this very function
+//          (extracted from this file) against f64 std.math.exp. Knock-on
+//          effect: the softmax it feeds differs from an f64 softmax by at most
+//          1.6e-7 per probability, and the greedy 256-step token ids come out
+//          token-for-token identical to the baseline's, so the error never
+//          reaches the decoder.
+//   range: inputs are clamped to [-87, 88]. exp(-87) = 1.6e-38 is the smallest
+//          value the (k+127)<<23 trick still resolves, exp(88) = 1.7e38 the
+//          largest finite f32. The clamps only fire where the result no longer
+//          matters: softmax subtracts the maximum first, so it never passes
+//          x > 0, and in swiglu a large negative h gives a sigmoid that rounds
+//          to 1.0 (or to a ~1e-37 denormal) with or without the clamp.
+// ---------------------------------------------------------------------------
+inline fn vector_exp8 (a: @Vector(exp_vec_width, f32)) @Vector(exp_vec_width, f32) {
+  const V = @Vector(exp_vec_width, f32);
+  const x = @min(@max(a, @as(V, @splat(-87.0))), @as(V, @splat(88.0)));
+  // k = round(x * log2 e), r = x - k * ln2  (|r| <= ln2/2)
+  const k = @floor(@mulAdd(V, x, @splat(1.4426950408889634), @splat(0.5)));
+  const r = @mulAdd(V, k, @splat(-0.6931471805599453), x);
+  // exp(r) = 1 + r + r^2/2 + r^3/6 + r^4/24 + r^5/120 (Horner, 5 FMAs)
+  var p: V = @splat(1.0 / 120.0);
+  p = @mulAdd(V, p, r, @splat(1.0 / 24.0));
+  p = @mulAdd(V, p, r, @splat(1.0 / 6.0));
+  p = @mulAdd(V, p, r, @splat(0.5));
+  p = @mulAdd(V, p, r, @splat(1.0));
+  p = @mulAdd(V, p, r, @splat(1.0));
+  // scale by 2^k, built as the exponent field of a f32
+  const kint: @Vector(exp_vec_width, i32) = @intFromFloat(k);
+  const scale: V = @bitCast((kint + @as(@Vector(exp_vec_width, i32), @splat(127))) <<
+                            @as(@Vector(exp_vec_width, u5), @splat(23)));
+  return p * scale;
 }
 
 
@@ -285,13 +407,43 @@ const Tokenizer = struct {
 /// o[i] = dot(weight row i, x) for every row i -- the GEMV that dominates the
 /// runtime (43 calls per token). Same two nested loops as main.zig's matmul;
 /// only the inner loop is now a SIMD dot product.
+/// B2: `R` independent dots (i.e. `R` weight rows against the same vector x)
+/// computed in ONE pass over x.  Same accumulators and same summation order as
+/// vector_dot_product, so the numerical result is bit-identical to the
+/// row-at-a-time version while the row-end reduce/shuffle chain of row r is
+/// hidden behind the FMAs of rows r+1..R-1.
+inline fn dot_rows_2 (o: *[2]f32, w: []const f32, x: []const f32, n: usize) void {
+  const V = Vector(dot_vec_width, f32);
+  var acc: [2][4]V = @splat(@splat(@as(V, @splat(0.0))));
+  var j: usize = 0;
+  while (j + 4*dot_vec_width <= n) : (j += 4*dot_vec_width) {
+    inline for (0..2) |r| {
+      inline for (0..4) |k| {
+        const off = r*n + j + k*dot_vec_width;
+        acc[r][k] = @mulAdd(V, w[off..][0..dot_vec_width].*, x[j+k*dot_vec_width..][0..dot_vec_width].*, acc[r][k]);
+      }
+    }
+  }
+  inline for (0..2) |r| {
+    var sum = @reduce(.Add, (acc[r][0] + acc[r][1]) + (acc[r][2] + acc[r][3]));
+    var jj = j;
+    while (jj < n) : (jj += 1) {
+      sum = @mulAdd(f32, w[r*n + jj], x[jj], sum);
+    }
+    o[r] = sum;
+  }
+}
+
 fn matmul (o: []f32, w: []const f32, x:[]const f32) void {
   const d = o.len;
   const n = x.len;
   assert(w.len == n * d);
-  for (0..d) |i| {
-    const w1 = w[n*i..][0..n];
-    o[i] = vector_dot_product(w1, x);
+  var i: usize = 0;
+  while (i + 2 <= d) : (i += 2) {
+    dot_rows_2(o[i..][0..2], w[n*i..][0..2*n], x, n);
+  }
+  while (i < d) : (i += 1) {
+    o[i] = vector_dot_product(w[n*i..][0..n], x);
   }
 }
 
@@ -337,10 +489,22 @@ fn vector_dot_product (w: []const f32, x: []const f32) f32 {
     a2 = @mulAdd(Vector(dot_vec_width, f32), w[j+2*dot_vec_width..][0..dot_vec_width].*, x[j+2*dot_vec_width..][0..dot_vec_width].*, a2);
     a3 = @mulAdd(Vector(dot_vec_width, f32), w[j+3*dot_vec_width..][0..dot_vec_width].*, x[j+3*dot_vec_width..][0..dot_vec_width].*, a3);
   }
-  // fold the 4 accumulators into one 8-lane vector, then reduce 8 -> 1 scalar.
-  var sum = @reduce(.Add, (a0 + a1) + (a2 + a3));
-  // trailing <32 elements: finish scalar (all lengths here are multiples of 8,
-  // so this loop is at most 31 iterations and is correct for arbitrary n).
+  // fold the 4 accumulators into one 8-lane vector.
+  const vsum = (a0 + a1) + (a2 + a3);
+  // A1b: same vectorised tail, but the n % 32 == 0 case (every GEMV length in
+  // this model: 288 and 768) takes a branch that keeps the baseline reduce, so
+  // it pays neither the extra vector add nor the extra 8-wide accumulator.
+  // Only the attn_qk dots (hsize = 48) enter the vector-tail path.
+  var sum: f32 = undefined;
+  if (j == w.len) {
+    sum = @reduce(.Add, vsum);
+  } else {
+    var t0: Vector(dot_vec_width, f32) = @splat(0.0);
+    while (j + dot_vec_width <= w.len) : (j += dot_vec_width) {
+      t0 = @mulAdd(Vector(dot_vec_width, f32), w[j..][0..dot_vec_width].*, x[j..][0..dot_vec_width].*, t0);
+    }
+    sum = @reduce(.Add, vsum + t0);
+  }
   while (j < w.len) : (j += 1) {
     sum = @mulAdd(f32, w[j], x[j], sum);
   }
@@ -385,18 +549,70 @@ fn rmsnorm(o: []f32, x: []f32, w: []f32) void {
 }
 
 
+/// softmax over x, in place: pass 1 finds the maximum, pass 2 writes
+/// exp(x-max) and accumulates the sum, pass 3 divides every element by it.
+/// Same three passes as main.zig; pass 2 is what changed: the scalar
+/// std.math.exp call per element (an out-of-line libm call, 32000 per token)
+/// becomes vector_exp8 over 8 lanes, and the running sum stays an 8-lane vector
+/// with one partial sum per lane, reduced once after the loop, so no horizontal
+/// reduction is inside the loop. The < 8 leftover elements (none here:
+/// nvocab = 32000) still use std.math.exp.
 fn softmax (x: []f32) void {
-  var max = x[0];
-  for (x[1..]) |v| {
-    if (v > max) max = v;
+  const V = @Vector(exp_vec_width, f32);
+  // G2/S2 = S1 + 4 independent max accumulators (shortens the dependency
+  // chain of the reduction: 32000 -> 4 lanes x 1000 sequential @max).
+  var vm0: V = @splat(x[0]);
+  var vm1: V = vm0;
+  var vm2: V = vm0;
+  var vm3: V = vm0;
+  var i: usize = 0;
+  const W = exp_vec_width;
+  while (i + 4 * W <= x.len) : (i += 4 * W) {
+    vm0 = @max(vm0, @as(V, x[i..][0..W].*));
+    vm1 = @max(vm1, @as(V, x[i + W..][0..W].*));
+    vm2 = @max(vm2, @as(V, x[i + 2 * W..][0..W].*));
+    vm3 = @max(vm3, @as(V, x[i + 3 * W..][0..W].*));
   }
-  var sum: f32 = 0.0;
-  for (0..x.len) |i| {
-    x[i] = std.math.exp(x[i]-max);
+  while (i + W <= x.len) : (i += W) {
+    vm0 = @max(vm0, @as(V, x[i..][0..W].*));
+  }
+  var max: f32 = @reduce(.Max, @max(@max(vm0, vm1), @max(vm2, vm3)));
+  while (i < x.len) : (i += 1) {
+    if (x[i] > max) max = x[i];
+  }
+  const maxv: V = @splat(max);
+  var vs0: V = @splat(0.0);
+  var vs1: V = vs0;
+  var vs2: V = vs0;
+  var vs3: V = vs0;
+  i = 0;
+  while (i + 4 * W <= x.len) : (i += 4 * W) {
+    const e0 = vector_exp8(@as(V, x[i..][0..W].*) - maxv);
+    const e1 = vector_exp8(@as(V, x[i + W..][0..W].*) - maxv);
+    const e2 = vector_exp8(@as(V, x[i + 2 * W..][0..W].*) - maxv);
+    const e3 = vector_exp8(@as(V, x[i + 3 * W..][0..W].*) - maxv);
+    x[i..][0..W].* = e0;
+    x[i + W..][0..W].* = e1;
+    x[i + 2 * W..][0..W].* = e2;
+    x[i + 3 * W..][0..W].* = e3;
+    vs0 += e0;
+    vs1 += e1;
+    vs2 += e2;
+    vs3 += e3;
+  }
+  while (i + W <= x.len) : (i += W) {
+    const e = vector_exp8(@as(V, x[i..][0..W].*) - maxv);
+    x[i..][0..W].* = e;
+    vs0 += e;
+  }
+  var sum: f32 = @reduce(.Add, (vs0 + vs1) + (vs2 + vs3));
+  while (i < x.len) : (i += 1) {
+    x[i] = std.math.exp(x[i] - max);
     sum += x[i];
   }
-  for (0..x.len) |i| {
-    x[i] /= sum;
+  const inv: f32 = 1.0 / sum;
+  for (0..x.len) |j| {
+    x[j] *= inv;
   }
 }
 
@@ -414,6 +630,20 @@ fn transformer (token: usize, pos: usize, c: *const Config, s: *State, w: *const
   const fpos: f32 = @floatFromInt(pos);
   const x = s.x;
   @memcpy(x, w.embeddings[token*dim..][0..dim]);
+  // rope angles for this position. They depend only on (pos, i), i.e. they are
+  // identical in all nlayers layers, but the baseline recomputed them inside the
+  // layer loop: nlayers * dim/2 = 6*144 = 864 pow+cos+sin triples per token.
+  // Fill the table once per token (144 of each) and let the layers read it,
+  // measured 0.024 ms/token.
+  assert(dim / 2 <= rope_table_len);
+  for (0..dim/2) |ii| {
+    const i = ii * 2;
+    const fhdim: f32 = @floatFromInt(i % hsize);
+    const freq = 1.0 / std.math.pow(f32, 10000.0, fhdim / fhsize);
+    const val: f32 = fpos * freq;
+    rope_cos[ii] = std.math.cos(val);
+    rope_sin[ii] = std.math.sin(val);
+  }
   for (0..c.nlayers) |l| {
     const loff = l * c.ncontext * kvdim;
     rmsnorm(s.x1, x, w.wrmsattn[l*dim..][0..dim]);
@@ -424,11 +654,8 @@ fn transformer (token: usize, pos: usize, c: *const Config, s: *State, w: *const
     matmul(s.vp, w.wv[l*dim*kvdim..][0..dim*kvdim], s.x1);
     for (0..dim/2) |ii| {
       const i = ii * 2;
-      const fhdim: f32 = @floatFromInt((i) % hsize);
-      const freq = 1.0 / std.math.pow(f32, 10000.0, fhdim / fhsize);
-      const val: f32 = fpos * freq;
-      const fcr = std.math.cos(val);
-      const fci = std.math.sin(val);
+      const fcr = rope_cos[ii];
+      const fci = rope_sin[ii];
       const v0 = s.q[i];
       const v1 = s.q[i+1];
       s.q[i] = v0 * fcr - v1 * fci;
@@ -450,9 +677,22 @@ fn transformer (token: usize, pos: usize, c: *const Config, s: *State, w: *const
       softmax(attn[0.. pos+1]);
       var x1 = s.x1[h*hsize..][0..hsize];
       @memset(x1, 0);
+      // attn @ v: x1[i] = sum_t attn[t] * v[t][i] -- a rank-1 update per
+      // (layer, head, position). Written as an explicit 8-lane @Vector with
+      // @mulAdd because the scalar form above is scalarised by LLVM (one SSE
+      // addss per element); 8 divides hsize = 48 exactly, measured 0.135
+      // ms/token. The loads of v stay sequential, this is not a GEMV.
+      const V = @Vector(8, f32);
       for (0..pos+1) |t| {
         const v = s.vcache[loff+t*kvdim+(h/kvmul)*hsize..][0..hsize];
-        for (0..hsize) |i| {
+        const av: V = @splat(attn[t]);
+        var i: usize = 0;
+        while (i + 8 <= hsize) : (i += 8) {
+          const xv: V = x1[i..][0..8].*;
+          const vv: V = v[i..][0..8].*;
+          x1[i..][0..8].* = @mulAdd(V, av, vv, xv);
+        }
+        while (i < hsize) : (i += 1) {
           x1[i] += attn[t] * v[i];
         }
       }
@@ -466,10 +706,24 @@ fn transformer (token: usize, pos: usize, c: *const Config, s: *State, w: *const
     rmsnorm(s.x1, x, w.wrmsffn[l*dim..][0..dim]);
     matmul(s.h, w.w1[l*dim*ffndim..][0..dim*ffndim], s.x1);
     matmul(s.h1, w.w3[l*dim*ffndim..][0..dim*ffndim], s.x1);
-    for (0..ffndim) |i| {
-      var v = s.h[i];
-      v = v * (1.0/(1.0+std.math.exp(-v))) * s.h1[i];
-      s.h[i] = v;
+    // swiglu: h[i] = h[i] * silu(h[i]) * h1[i], silu(v) = v / (1 + exp(-v)),
+    // the same activation as c/run.c. The exp() is the vector_exp8 used by
+    // softmax: 1152 scalar libm calls per layer -> 144 vector FMAs, measured
+    // 0.051 ms/token. 8 divides 4*dim = 1152 exactly; the tail keeps the loop
+    // correct for any ffndim.
+    const V = @Vector(exp_vec_width, f32);
+    var hi: usize = 0;
+    while (hi + exp_vec_width <= ffndim) : (hi += exp_vec_width) {
+      const hv: V = s.h[hi..][0..exp_vec_width].*;
+      const h1v: V = s.h1[hi..][0..exp_vec_width].*;
+      const one: V = @splat(1.0);
+      const sig = one / (one + vector_exp8(-hv));
+      s.h[hi..][0..exp_vec_width].* = hv * sig * h1v;
+    }
+    while (hi < ffndim) : (hi += 1) {
+      var v = s.h[hi];
+      v = v * (1.0/(1.0+std.math.exp(-v))) * s.h1[hi];
+      s.h[hi] = v;
     }
     matmul(s.x1, w.w2[l*ffndim*dim..][0..ffndim*dim], s.h);
     for (0 .. x.len) |i| {
