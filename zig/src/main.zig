@@ -535,5 +535,5 @@ pub fn main (init: std.process.Init) !void {
   const elapsed_ns = timer.?.untilNow(io, .awake).nanoseconds;
   const tokens_per_sec: u32 = @intFromFloat(
             @as(f64, @floatFromInt(pos-1))*std.time.ns_per_s / @as(f64, @floatFromInt(elapsed_ns)));
-  log("\n\n{d} tokens per second\n", .{tokens_per_sec});
+  log("\n\nzrun: total {d} tokens, speed {d} tok/s\n\n\n", .{pos-1, tokens_per_sec});
 }

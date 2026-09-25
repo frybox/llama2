@@ -716,7 +716,7 @@ void generate (Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
   printf("\n");
   if (pos > 1) {
     long end = time_in_ms();
-    fprintf(stderr, "\ntotal %d tokens, speed %.1f token/s\n", pos-1, (pos-1) / (double)(end-start)*1000);
+    fprintf(stderr, "\ntotal %d tokens, speed %.1f tok/s\n\n\n", pos-1, (pos-1) / (double)(end-start)*1000);
   }
   free(prompt_tokens);
 }
