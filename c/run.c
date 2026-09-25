@@ -5,8 +5,6 @@
 #include <time.h>
 #include <math.h>
 #include <string.h>
-#include <immintrin.h>
-#include <cpuid.h>
 #include <fcntl.h>
 #if defined _WIN32
     #include "win.h"
@@ -48,8 +46,6 @@ typedef struct {
   float *h;
   float *h1;
   float *q;
-  float *kp;
-  float *vp;
   float *attn;
   float *logits;
   float *kcache;
@@ -87,8 +83,6 @@ void malloc_state(State *s, Config *c) {
   s->h      = calloc(c->ffndim, sizeof(*s->h));
   s->h1     = calloc(c->ffndim, sizeof(*s->h1));
   s->q      = calloc(c->dim, sizeof(*s->q));
-  s->kp     = NULL;
-  s->vp     = NULL;
   s->attn   = calloc(c->nheads * c->ncontext, sizeof(*s->attn));
   s->logits = calloc(c->nvocab, sizeof(*s->logits));
   s->kcache = calloc(c->nlayers * c->ncontext * kvdim, sizeof(*s->kcache));
@@ -210,11 +204,7 @@ void softmax(float *x, int size) {
 }
 
 
-// ------------------------------------------------------------------ scalar ----
-// o[i] = dot(w + i*n, x, n).  Row-major, x is the (small) vector reused for every
-// row: this is a GEMV.  Bit-exact reference; also the fallback for CPUs without
-// AVX2+FMA.
-static void matmul_scalar(float *o, float *w, float *x, int n, int d) {
+static void matmul(float *o, float *w, float *x, int n, int d) {
   for (int i=0; i<d; i++) {
     float v = 0.0f;
     for(int j=0; j<n; j++) {
@@ -222,76 +212,6 @@ static void matmul_scalar(float *o, float *w, float *x, int n, int d) {
     }
     o[i] = v;
   }
-}
-
-
-// -------------------------------------------------------------------- avx2 ----
-// AVX2/FMA GEMV.  For each output row, the j inner loop is vectorized in 8-float
-// steps: load 8 floats of the w row and 8 floats of x, accumulate with
-// _mm256_fmadd_ps into a single 256-bit accumulator, then reduce the 8 lanes to
-// a scalar and finish the tail (<8 elems) scalar.
-//
-// FMA folds each pair into one fused multiply-add, so results are NOT bit-exact
-// with matmul_scalar (fma(x,y,z) != x*y+z in general) -- that is fine here (the
-// model samples, it is non-deterministic anyway); relative error stays tiny.
-// Compiled with plain -O3 (no -mavx2 needed): the kernel carries
-// __attribute__((target("avx2","fma"))); the wrapper (below) checks CPUID at
-// runtime and RUN_KERNEL=scalar|avx2 (default avx2) can force the scalar path.
-static void __attribute__((target("avx2,fma")))
-matmul_avx2_impl(float *o, float *w, float *x, int n, int d) {
-  for (int i=0; i<d; i++) {
-    const float *row = w + (size_t)i*n;
-    // 4 independent 256-bit accumulators -> 4-way ILP breaks the FMA latency
-    // chain (one 256-bit FMA per cycle, 4-cycle latency); unroll 32 floats.
-    __m256 a0 = _mm256_setzero_ps();
-    __m256 a1 = _mm256_setzero_ps();
-    __m256 a2 = _mm256_setzero_ps();
-    __m256 a3 = _mm256_setzero_ps();
-    int j = 0;
-    for (; j+32 <= n; j += 32) {
-      a0 = _mm256_fmadd_ps(_mm256_loadu_ps(row+j),      _mm256_loadu_ps(x+j),      a0);
-      a1 = _mm256_fmadd_ps(_mm256_loadu_ps(row+j+8),    _mm256_loadu_ps(x+j+8),    a1);
-      a2 = _mm256_fmadd_ps(_mm256_loadu_ps(row+j+16),   _mm256_loadu_ps(x+j+16),   a2);
-      a3 = _mm256_fmadd_ps(_mm256_loadu_ps(row+j+24),   _mm256_loadu_ps(x+j+24),   a3);
-    }
-    // reduce 4 accumulators (32 lanes) to a scalar.
-    a0 = _mm256_add_ps(a0, a1);
-    a2 = _mm256_add_ps(a2, a3);
-    a0 = _mm256_add_ps(a0, a2);
-    float buf[8];
-    _mm256_storeu_ps(buf, a0);
-    float v = ((buf[0]+buf[1])+(buf[2]+buf[3])) + ((buf[4]+buf[5])+(buf[6]+buf[7]));
-    // trailing <32 elements: finish scalar (n is a multiple of 8 in practice,
-    // so this loop is at most 31 iterations; correct for arbitrary n).
-    for (; j<n; j++) {
-      v += row[j] * x[j];
-    }
-    o[i] = v;
-  }
-}
-
-
-// ------------------------------------------------------------ dispatch --------
-// Cached CPUID check: need both AVX2 (CPUID(1).ECX[5]) and FMA (ECX[8]).
-// RUN_KERNEL=scalar forces the scalar path; avx2 (default) uses the kernel
-// when supported, else falls back to scalar.
-static int run_use_avx2(void) {
-  static int cached = -1;
-  if (cached >= 0) return cached;
-  const char *e = getenv("RUN_KERNEL");
-  if (e && strcmp(e, "scalar") == 0) { cached = 0; return 0; }
-  unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
-  __cpuid(1, eax, ebx, ecx, edx);
-  int has_fma  = (ecx & (1u << 8))  != 0; // CPUID(1).ECX[8]  = FMA
-  int has_avx2 = (ecx & (1u << 5))  != 0; // CPUID(1).ECX[5]  = AVX2
-  cached = (has_fma && has_avx2) ? 1 : 0;
-  return cached;
-}
-
-
-void matmul(float *o, float *w, float *x, int n, int d) {
-  if (run_use_avx2()) matmul_avx2_impl(o, w, x, n, d);
-  else matmul_scalar(o, w, x, n, d);
 }
 
 
@@ -313,11 +233,11 @@ float *forward(Transformer *tr, int token, int pos) {
     // 1. self-attention sublayer
     rmsnorm(s->x1, x, w->wrmsattn+l*dim, dim);
     unsigned long long loff = l * c->ncontext * kvdim;
-    s->kp = s->kcache + loff + pos*kvdim;
-    s->vp = s->vcache + loff + pos*kvdim;
+    float *k = s->kcache + loff + pos*kvdim;
+    float *v = s->vcache + loff + pos*kvdim;
     matmul(s->q, w->wq + l*dim*dim, s->x1, dim, dim);
-    matmul(s->kp, w->wk + l*dim*kvdim, s->x1, dim, kvdim);
-    matmul(s->vp, w->wv + l*dim*kvdim, s->x1, dim, kvdim);
+    matmul(k, w->wk + l*dim*kvdim, s->x1, dim, kvdim);
+    matmul(v, w->wv + l*dim*kvdim, s->x1, dim, kvdim);
     for (int i=0; i<dim; i+=2) {
       int hdim = i % hsize;
       float freq = 1.0f / powf(10000.0f, hdim/(float)hsize);
@@ -328,12 +248,11 @@ float *forward(Transformer *tr, int token, int pos) {
       s->q[i]   = v0*fcr - v1*fci;
       s->q[i+1] = v0*fci + v1*fcr;
       if (i < kvdim) {
-        v0 = s->kp[i]; v1 = s->kp[i+1];
-        s->kp[i]   = v0*fcr - v1*fci;
-        s->kp[i+1] = v0*fci + v1*fcr;
+        v0 = k[i]; v1 = k[i+1];
+        k[i]   = v0*fcr - v1*fci;
+        k[i+1] = v0*fci + v1*fcr;
       }
     }
-    // 可按h并行处理所有head
     for (int h=0; h<c->nheads; h++) {
       float *q = s->q + h*hsize;
       float *attn = s->attn + h*c->ncontext;
@@ -664,7 +583,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
   int *prompt_tokens = (int*)malloc((strlen(prompt)+3)*sizeof(int));
   encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
   if (num_prompt_tokens < 1) {
-    mexit("something iswrong, expected at least 1 prompt token");
+    mexit("something is wrong, expected at least 1 prompt token");
   }
   long start = 0;
   int next;

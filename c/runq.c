@@ -7,8 +7,6 @@
 #include <math.h>
 #include <string.h>
 #include <fcntl.h>
-#include <immintrin.h>
-#include <cpuid.h>
 #if defined _WIN32
     #include "win.h"
 #else
@@ -302,32 +300,7 @@ void softmax (float *x, int size) {
 }
 
 
-// AVX2 int8 GEMV kernel for runq.c, plus dispatch wrapper + scalar baseline.
-//
-// matmul(o, w, x, n, d):  o[i] = sum_j w[i*n+j] * x[j]   (dequantized)
-//   w: QuantizedTensor  q (n*d int8), s (d*(n/GS) float scales, row-major)
-//   x: QuantizedTensor  q (n int8),   s (n/GS float scales)
-//   dequant: o[i] = sum_{g} (int) (sum_{k=0}^{GS-1} w->q[i*n+j+k]*x->q[j+k])
-//                        * w->s[(i*n+j)/GS] * x->s[j/GS]
-//
-// AVX2 kernel (matmul_avx2_impl), per output row i, one quantization group of
-// GS==32 elements at a time:
-//   - load 32 int8 of w(row i) and 32 int8 of x (two 128-bit loads each)
-//   - sign-extend to 16 int16 each (vpunpcklbw/vpunpckhbw via _mm256_cvtepi8_epi16)
-//   - P = vpmaddwd: 8 int32, lane k = W[2k]*X[2k] + W[2k+1]*X[2k+1]
-//     (int8*int8 fits int16 exactly; no overflow)
-//   - exact horizontal sum of the 8 int32 -> int32 group sum `iv`
-//     (int32 add is exact & associative, |iv| <= 32*127*127 = 516128 < 2^31)
-//   - v += (float)iv * w->s[...] * x->s[...]   (same float ops/order as scalar)
-//
-// Bit-exact with matmul_scalar when GS==32 (and for any n, trailing handled).
-// Compiled with plain -O3/-Ofast (no -mavx2 needed): the kernel carries
-// __attribute__((target("avx2"))); dispatch probes CPUID at runtime (see
-// runq_cpu below), requires GS==32, and RUNQ_KERNEL=scalar|avx2|avx512|amx
-// (default: auto) can force a specific kernel.
-
-// ---------------------------------------------------------------- scalar -----
-static void matmul_scalar (float *o, QuantizedTensor *w, QuantizedTensor *x, int n, int d) {
+void matmul (float *o, QuantizedTensor *w, QuantizedTensor *x, int n, int d) {
   for (int i = 0; i < d; i++) {
     float v = 0.0f;
     for (int j = 0; j < n; j += GS) {
@@ -339,189 +312,6 @@ static void matmul_scalar (float *o, QuantizedTensor *w, QuantizedTensor *x, int
       v += ((float)iv) * w->s[(in + j) / GS] * x->s[j / GS];
     }
     o[i] = v;
-  }
-}
-
-// ------------------------------------------------------------------ avx2 -----
-static void __attribute__((target("avx2")))
-matmul_avx2_impl (float *o, QuantizedTensor *w, QuantizedTensor *x, int n, int d) {
-  const int8_t *wq = w->q;
-  const int8_t *xq = x->q;
-  const float *ws = w->s;
-  const float *xs = x->s;
-  const int G = 32; // GS, guaranteed 32 by dispatch.  A literal (not GS) so the
-  // compiler folds /G to shifts; as `GS` (a runtime global) gcc emits an idiv
-  // per group index, ~30% slower (measured 510 -> 630 tok/s end-to-end).
-  for (int i = 0; i < d; i++) {
-    const int8_t *wrow = wq + (size_t)i * n;
-    // 4-lane float accumulator: one vector add per 4 groups (4-way ILP), and a
-    // single int32->float conversion per 4 groups.
-    __m128 acc = _mm_setzero_ps();
-    int j = 0;
-    for (; j + 4 * G <= n; j += 4 * G) {
-      int32_t s[4];
-      for (int g = 0; g < 4; g++) {
-        int jg = j + g * G;
-        __m128i wl = _mm_loadu_si128((const __m128i *)(wrow + jg));
-        __m128i wh = _mm_loadu_si128((const __m128i *)(wrow + jg + 16));
-        __m128i xl = _mm_loadu_si128((const __m128i *)(xq + jg));
-        __m128i xh = _mm_loadu_si128((const __m128i *)(xq + jg + 16));
-        __m256i Wl = _mm256_cvtepi8_epi16(wl);
-        __m256i Wh = _mm256_cvtepi8_epi16(wh);
-        __m256i Xl = _mm256_cvtepi8_epi16(xl);
-        __m256i Xh = _mm256_cvtepi8_epi16(xh);
-        __m256i Pl = _mm256_madd_epi16(Wl, Xl); // 8 int32 (16 prods, elems 0..15)
-        __m256i Ph = _mm256_madd_epi16(Wh, Xh); // 8 int32 (16 prods, elems 16..31)
-        __m256i P  = _mm256_add_epi32(Pl, Ph);  // 16 int32 (all 32 prods, exact)
-        // exact horizontal sum of each 128-bit lane (4 int32) to its scalar sum.
-        // Note: _MM_SHUFFLE(a,b,c,d) places src[d] into dst[0], src[c]->dst[1], etc.
-        //   S[0]=P0+P3, S[1]=P1+P2, S[2]=P2+P0, S[3]=P3+P1  (per 128-bit lane)
-        //   U[0]=S[0]+S[1]=P0+P1+P2+P3  (verified against a concrete [1,2,3,4] case)
-        __m256i S = _mm256_add_epi32(P, _mm256_shuffle_epi32(P, _MM_SHUFFLE(1, 0, 3, 2)));
-        __m256i U = _mm256_add_epi32(S, _mm256_shuffle_epi32(S, _MM_SHUFFLE(3, 3, 3, 3)));
-        int32_t lo = _mm_extract_epi32(_mm256_castsi256_si128(U), 0);   // sum of 16 prods (elems 0..15)
-        int32_t hi = _mm_extract_epi32(_mm256_extracti128_si256(U, 1), 0); // sum of 16 prods (elems 16..31)
-        s[g] = lo + hi; // exact sum of all 32 products in group g
-      }
-      // 4 group int32 sums -> 4 float, one vector multiply-accumulate
-      __m128i si = _mm_set_epi32(s[3], s[2], s[1], s[0]);
-      __m128 fv = _mm_cvtepi32_ps(si); // 4 int32 -> 4 float (vcvtdq2ps)
-      __m128 wsv = _mm_loadu_ps(ws + (i * n + j) / G); // 4 w scales
-      __m128 xsv = _mm_loadu_ps(xs + j / G);           // 4 x scales
-      acc = _mm_add_ps(acc, _mm_mul_ps(_mm_mul_ps(fv, wsv), xsv));
-    }
-    // horizontal-sum the 4-lane float accumulator.
-    // NOTE: _mm_shuffle_ps uses a DIFFERENT imm encoding than _mm256_shuffle_epi32
-    // (each dst lane can only pick from {a0,a1,b0,b1}), so use a scalar reduce here.
-    float v;
-    {
-      float fv[4];
-      _mm_storeu_ps(fv, acc);
-      v = (fv[0] + fv[1]) + (fv[2] + fv[3]);
-    }
-    // trailing groups after the 4-group batches: continue from the batch loop's
-    // final j (NOT (n/G)*G — that would skip a group when n%4G != 0, e.g. n=288).
-    for (int j2 = j; j2 < n; j2 += G) {
-      int32_t iv = 0;
-      for (int k = 0; k < G; k++) iv += (int32_t)wrow[j2 + k] * (int32_t)xq[j2 + k];
-      v += (float)iv * ws[(i * n + j2) / G] * xs[j2 / G];
-    }
-    o[i] = v;
-  }
-}
-
-static void matmul_avx2 (float *o, QuantizedTensor *w, QuantizedTensor *x, int n, int d) {
-  matmul_avx2_impl(o, w, x, n, d);
-}
-
-// --------------------------------------------------------------- dispatch ----
-// CPU feature table (x86-64). Everything is probed at RUNTIME via CPUID, so
-// no -mavx2/-mavx512f build flags are needed: each kernel carries
-// __attribute__((target("..."))), and this table only DECIDES which kernel
-// to call.
-//
-//   feature      CPUID leaf:reg[bit]             notes
-//   AVX2         CPUID(7,0).EBX[5]               256-bit integer+float
-//   FMA          CPUID(1).ECX[12]                fused multiply-add
-//   AVX512F      CPUID(7,0).EBX[16]              512-bit vector state (ZMM)
-//   AVX512BW     CPUID(7,0).EBX[30]              512-bit byte/word
-//   AVX512VL     CPUID(7,0).EBX[31]              512-bit instrs on 128/256 regs
-//   AVX512VNNI   CPUID(7,0).ECX[11]              512-bit vdpbusd int8 dot (future)
-//   AMX-TILE     CPUID(7,0).EDX[24]              AMX tile config (future GEMM)
-//   AMX-BF16     CPUID(7,0).EDX[22]              AMX bf16 (future GEMM)
-//   AMX-INT8     CPUID(7,0).EDX[25]              AMX int8 (int8 GEMM, future)
-//
-//   (512-bit int8 GEMV needs F+BW+VL together; an AMX GEMM needs AMX-TILE plus
-//   the element-type feature (AMX-INT8 for int8).  Verified against the Linux
-//   kernel cpufeatures.h, which populates /proc/cpuinfo on this host.)
-//
-// Selection picks the HIGHEST level that is (a) supported by the CPU and
-// (b) has a kernel implemented here:  scalar < avx2 < avx512 < amx.
-// Every vector kernel is specialized for GS==32, so other group sizes fall
-// back to scalar.  Override: RUNQ_KERNEL=scalar|avx2|avx512|amx (forcing a
-// kernel your CPU lacks will crash — that is on you).
-typedef struct {
-  int has_fma;
-  int has_avx2;
-  int has_avx512f;
-  int has_avx512bw;
-  int has_avx512vl;
-  int has_avx512vnni;
-  int has_amx_tile;
-  int has_amx_bf16;
-  int has_amx_int8;
-  int level;        // selected kernel: 0 scalar, 1 avx2, 2 avx512, 3 amx
-  const char *kernel;
-} CpuCaps;
-
-static CpuCaps runq_cpu (void) {
-  static CpuCaps caps;
-  static int done = 0;
-  if (done) return caps;
-  done = 1;
-
-  unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
-  unsigned int maxid = __get_cpuid_max(0, 0); // max standard CPUID leaf
-
-  __cpuid(1, eax, ebx, ecx, edx);
-  caps.has_fma  = (ecx >> 12) & 1;   // CPUID(1).ECX[12] = FMA
-
-  if (maxid >= 7) {
-    __cpuid_count(7, 0, eax, ebx, ecx, edx);
-    caps.has_avx2        = (ebx >> 5)  & 1;   // CPUID(7,0).EBX[5]
-    caps.has_avx512f     = (ebx >> 16) & 1;   // CPUID(7,0).EBX[16]
-    caps.has_avx512bw    = (ebx >> 30) & 1;   // CPUID(7,0).EBX[30]
-    caps.has_avx512vl    = (ebx >> 31) & 1;   // CPUID(7,0).EBX[31]
-    caps.has_avx512vnni  = (ecx >> 11) & 1;   // CPUID(7,0).ECX[11]
-    caps.has_amx_bf16    = (edx >> 22) & 1;   // CPUID(7,0).EDX[22]
-    caps.has_amx_tile    = (edx >> 24) & 1;   // CPUID(7,0).EDX[24]
-    caps.has_amx_int8    = (edx >> 25) & 1;   // CPUID(7,0).EDX[25]
-  }
-
-  // pick highest supported level.  Levels 2 (avx512) and 3 (amx) have no
-  // dedicated kernel yet, so auto-selection caps at the highest IMPLEMENTED
-  // level (RUNQ_KERNEL=avx512|amx can still force it for a CPU that has it).
-  int level = 0;
-  const char *kernel = "scalar";
-  if (caps.has_avx2) { level = 1; kernel = "avx2"; }
-  if (caps.has_avx512f && caps.has_avx512bw && caps.has_avx512vl) { level = 2; kernel = "avx512"; }
-  if (caps.has_amx_tile && (caps.has_amx_bf16 || caps.has_amx_int8)) { level = 3; kernel = "amx"; }
-  if (GS != 32) { level = 0; kernel = "scalar"; } // kernels specialized for GS==32
-
-  const int level_implemented = 1; // avx2 is the highest kernel written so far
-  if (level > level_implemented) { level = level_implemented; kernel = "avx2"; }
-
-  // manual override
-  const char *e = getenv("RUNQ_KERNEL");
-  if (e) {
-    if      (!strcmp(e, "scalar")) { level = 0; kernel = "scalar"; }
-    else if (!strcmp(e, "avx2"))   { level = 1; kernel = "avx2";   }
-    else if (!strcmp(e, "avx512")) { level = 2; kernel = "avx512"; }
-    else if (!strcmp(e, "amx"))    { level = 3; kernel = "amx";    }
-    else fprintf(stderr, "RUNQ_KERNEL: unknown value '%s', ignoring\n", e);
-  }
-  caps.level = level;
-  caps.kernel = kernel;
-  return caps;
-}
-
-static void runq_print_cpu (void) {
-  CpuCaps c = runq_cpu();
-  fprintf(stderr,
-    "cpu: avx2=%d fma=%d avx512f=%d avx512bw=%d avx512vl=%d avx512vnni=%d"
-    " amx_tile=%d amx_bf16=%d amx_int8=%d  -> matmul kernel: %s (GS=%d)\n",
-    c.has_avx2, c.has_fma, c.has_avx512f, c.has_avx512bw, c.has_avx512vl,
-    c.has_avx512vnni, c.has_amx_tile, c.has_amx_bf16, c.has_amx_int8,
-    c.kernel, GS);
-}
-
-void matmul (float *o, QuantizedTensor *w, QuantizedTensor *x, int n, int d) {
-  CpuCaps c = runq_cpu();
-  switch (c.level) {
-    case 1: matmul_avx2(o, w, x, n, d); break;
-    case 2: matmul_avx2(o, w, x, n, d); break; // TODO: 512-bit kernel (AVX512F+BW+VL)
-    case 3: matmul_avx2(o, w, x, n, d); break; // TODO: AMX tile kernel (AMX-TILE+INT8)
-    default: matmul_scalar(o, w, x, n, d);
   }
 }
 
@@ -568,7 +358,6 @@ float *forward (Transformer *tr, int token, int pos) {
         k[i+1] = v0*fci + v1*fcr;
       }
     }
-    // 可按h并行处理所有head
     for (int h=0; h<c->nheads; h++) {
       q = s->q + h*hsize;
       float *attn = s->attn + h*c->ncontext;
@@ -947,7 +736,6 @@ int main (int argc, char *argv[]) {
   }
   Transformer transformer;
   build_transformer(&transformer, checkpoint_path);
-  runq_print_cpu();
   Tokenizer tokenizer;
   build_tokenizer(&tokenizer, tokenizer_path, transformer.c.nvocab);
   Sampler sampler;
