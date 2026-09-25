@@ -406,6 +406,10 @@ fn transformer (token: usize, pos: usize, c: *const Config, s: *State, w: *const
   const ffndim = c.ffndim;
   const hsize = dim / c.nheads;
   const kvdim = hsize * c.nkvheads;
+  // GQA/MQA head mapping: nheads query heads share nkvheads key/value heads,
+  // so query head h reads the k/v head h/kvmul (c/run.c:305,341,352).
+  // kvmul == 1 (plain MHA, e.g. stories15M: 6/6) leaves the offsets unchanged.
+  const kvmul = c.nheads / c.nkvheads;
   const fhsize: f32 = @floatFromInt(hsize);
   const fpos: f32 = @floatFromInt(pos);
   const x = s.x;
@@ -440,14 +444,14 @@ fn transformer (token: usize, pos: usize, c: *const Config, s: *State, w: *const
       const q = s.q[h*hsize..][0..hsize];
       const attn = s.attn[h*c.ncontext..][0..c.ncontext];
       for (0..pos+1) |t| {
-        const k = s.kcache[loff+t*kvdim+h*hsize..][0..hsize];
+        const k = s.kcache[loff+t*kvdim+(h/kvmul)*hsize..][0..hsize];
         attn[t] = vector_dot_product(q, k) / std.math.sqrt(fhsize);
       }
       softmax(attn[0.. pos+1]);
       var x1 = s.x1[h*hsize..][0..hsize];
       @memset(x1, 0);
       for (0..pos+1) |t| {
-        const v = s.vcache[loff+t*kvdim+h*hsize..][0..hsize];
+        const v = s.vcache[loff+t*kvdim+(h/kvmul)*hsize..][0..hsize];
         for (0..hsize) |i| {
           x1[i] += attn[t] * v[i];
         }

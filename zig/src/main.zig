@@ -91,8 +91,6 @@ const State = struct {
   h: []f32,
   h1: []f32,
   q: []f32,
-  kp: []f32,
-  vp: []f32,
   attn: []f32,
   logits: []f32,
   logits_indexed: []IndexedF32,
@@ -285,6 +283,10 @@ fn transformer (token: usize, pos: usize, c: *const Config, s: *State, w: *const
   const ffndim = c.ffndim;
   const hsize = dim / c.nheads;
   const kvdim = hsize * c.nkvheads;
+  // GQA/MQA head mapping: nheads query heads share nkvheads key/value heads,
+  // so query head h reads the k/v head h/kvmul (c/run.c:305,341,352).
+  // kvmul == 1 (plain MHA, e.g. stories15M: 6/6) leaves the offsets unchanged.
+  const kvmul = c.nheads / c.nkvheads;
   const fhsize: f32 = @floatFromInt(hsize);
   const fpos: f32 = @floatFromInt(pos);
   const x = s.x;
@@ -293,11 +295,12 @@ fn transformer (token: usize, pos: usize, c: *const Config, s: *State, w: *const
     // 1. attention sublayer
     const loff = l * c.ncontext * kvdim;
     rmsnorm(s.x1, x, w.wrmsattn[l*dim..][0..dim]);
-    s.kp = s.kcache[loff+pos*kvdim..][0..kvdim];
-    s.vp = s.vcache[loff+pos*kvdim..][0..kvdim];
-    matmul(s.q, w.wq[l*dim*dim..][0..dim*dim], s.x1);
-    matmul(s.kp, w.wk[l*dim*kvdim..][0..dim*kvdim], s.x1);
-    matmul(s.vp, w.wv[l*dim*kvdim..][0..dim*kvdim], s.x1);
+    var q = s.q;
+    var k = s.kcache[loff+pos*kvdim..][0..kvdim];
+    var v = s.vcache[loff+pos*kvdim..][0..kvdim];
+    matmul(q, w.wq[l*dim*dim..][0..dim*dim], s.x1);
+    matmul(k, w.wk[l*dim*kvdim..][0..dim*kvdim], s.x1);
+    matmul(v, w.wv[l*dim*kvdim..][0..dim*kvdim], s.x1);
     for (0..dim/2) |ii| {
       const i = ii * 2;
       const fhdim: f32 = @floatFromInt((i) % hsize);
@@ -305,22 +308,22 @@ fn transformer (token: usize, pos: usize, c: *const Config, s: *State, w: *const
       const val: f32 = fpos * freq;
       const fcr = std.math.cos(val);
       const fci = std.math.sin(val);
-      var v0 = s.q[i];
-      var v1 = s.q[i+1];
-      s.q[i] = v0 * fcr - v1 * fci;
-      s.q[i+1] = v0 * fci + v1 * fcr;
+      var v0 = q[i];
+      var v1 = q[i+1];
+      q[i] = v0 * fcr - v1 * fci;
+      q[i+1] = v0 * fci + v1 * fcr;
       if (i < kvdim) {
-        v0 = s.kp[i];
-        v1 = s.kp[i+1];
-        s.kp[i] = v0 * fcr - v1 * fci;
-        s.kp[i+1] = v0 * fci + v1 * fcr;
+        v0 = k[i];
+        v1 = k[i+1];
+        k[i] = v0 * fcr - v1 * fci;
+        k[i+1] = v0 * fci + v1 * fcr;
       }
     }
     for (0..c.nheads) |h| {
-      const q = s.q[h*hsize..][0..hsize];
+      q = s.q[h*hsize..][0..hsize];
       const attn = s.attn[h*c.ncontext..][0..c.ncontext];
       for (0..pos+1) |t| {
-        const k = s.kcache[loff+t*kvdim+h*hsize..][0..hsize];
+        k = s.kcache[loff+t*kvdim+(h/kvmul)*hsize..][0..hsize];
         var sum: f32 = 0.0;
         for (0..hsize) |i| {
           sum += q[i] * k[i];
@@ -331,7 +334,7 @@ fn transformer (token: usize, pos: usize, c: *const Config, s: *State, w: *const
       var x1 = s.x1[h*hsize..][0..hsize];
       @memset(x1, 0);
       for (0..pos+1) |t| {
-        const v = s.vcache[loff+t*kvdim+h*hsize..][0..hsize];
+        v = s.vcache[loff+t*kvdim+(h/kvmul)*hsize..][0..hsize];
         for (0..hsize) |i| {
           x1[i] += attn[t] * v[i];
         }
