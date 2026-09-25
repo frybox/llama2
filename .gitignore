@@ -9,3 +9,6 @@ c/run.O3
 c/run.Ofast
 c/runq.ofast
 c/*.s
+
+# gprof output
+gmon.out
