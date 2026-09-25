@@ -326,7 +326,7 @@ fn matmul (o: []f32, w: QuantizedTensor, x: QuantizedTensor) void {
       for (0..GS) |k| {
         iv += @as(i32, w.q[ii+jj+k]) * @as(i32, x.q[jj+k]);
       }
-      v += @as(f32, @floatFromInt(iv)) * w.s[j] * x.s[j];
+      v += @as(f32, @floatFromInt(iv)) * w.s[i * x.s.len + j] * x.s[j];
     }
     o[i] = v;
   }
