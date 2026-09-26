@@ -6,9 +6,9 @@ pub fn build(b: *std.Build) void {
 
     // llama2 = the simple, scalar-kernel reference implementation (main.zig).
     const exe = b.addExecutable(.{
-        .name = "llama2",
+        .name = "llama2_cpu",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("src/llama2_cpu.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -25,9 +25,9 @@ pub fn build(b: *std.Build) void {
     // llama2v = same program, but the matmul/rmsnorm kernels use explicit
     // @Vector / @mulAdd SIMD (mainv.zig). ~4x faster than llama2.
     const exe_v = b.addExecutable(.{
-        .name = "llama2v",
+        .name = "llama2_cpuv",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/mainv.zig"),
+            .root_source_file = b.path("src/llama2_cpuv.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -43,9 +43,9 @@ pub fn build(b: *std.Build) void {
 
     // llama2q = same program, but int8_0 quantified embeddings and (attn & ffn) weights
     const exe_q = b.addExecutable(.{
-        .name = "llama2q",
+        .name = "llama2q_cpu",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/mainq.zig"),
+            .root_source_file = b.path("src/llama2q_cpu.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -65,9 +65,9 @@ pub fn build(b: *std.Build) void {
     // a per-token rope table. ~2.6x faster than llama2q (see the header in
     // mainqv.zig for the kernel notes).
     const exe_qv = b.addExecutable(.{
-        .name = "llama2qv",
+        .name = "llama2q_cpuv",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/mainqv.zig"),
+            .root_source_file = b.path("src/llama2q_cpuv.zig"),
             .target = target,
             .optimize = optimize,
         }),

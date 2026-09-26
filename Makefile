@@ -2,48 +2,42 @@
 # example override to clang: make run CC=clang
 CC = gcc
 
+CUDA = nvcc
+
 .PHONY: c cdebug crun ccuda ccudadebug ccrun
 
 # usually fastest for the current cpu
-c: c/run.c c/runq.c c/runv.c c/runqv.c
-	$(CC) -Ofast -march=native -o c/run c/run.c -lm
-	$(CC) -Ofast -march=native -o c/runq c/runq.c -lm
-	$(CC) -Ofast -march=native -o c/runv c/runv.c -lm
-	$(CC) -Ofast -march=native -o c/runqv c/runqv.c -lm
-
-# GPU (CUDA) builds: f32 weights and i8 quantized weights
-CUDA = nvcc
-ccuda: c/runcuda.c c/runqcuda.c
-	$(CUDA) -x cu -O3 -arch=native -o c/runcuda c/runcuda.c -lcudart -lm
-	$(CUDA) -x cu -O3 -arch=native -o c/runqcuda c/runqcuda.c -lcudart -lm
-
-ccudadebug: c/runcuda.c c/runqcuda.c
-	$(CUDA) -x cu -O0 -g -arch=native -o c/runcuda c/runcuda.c -lcudart -lm
-	$(CUDA) -x cu -O0 -g -arch=native -o c/runqcuda c/runqcuda.c -lcudart -lm
-
-ccrun: ccuda
-	c/runcuda
-	c/runqcuda
+c: c/llama2_cpu.c c/llama2q_cpu.c c/llama2_cpuv.c c/llama2q_cpuv.c c/llama2_cuda.c c/llama2q_cuda.c
+	$(CC) -Ofast -march=native -o c/llama2_cpu c/llama2_cpu.c -lm
+	$(CC) -Ofast -march=native -o c/llama2q_cpu c/llama2q_cpu.c -lm
+	$(CC) -Ofast -march=native -o c/llama2_cpuv c/llama2_cpuv.c -lm
+	$(CC) -Ofast -march=native -o c/llama2q_cpuv c/llama2q_cpuv.c -lm
+	$(CUDA) -x cu -O3 -arch=native -o c/llama2_cuda c/llama2_cuda.c -lcudart -lm
+	$(CUDA) -x cu -O3 -arch=native -o c/llama2q_cuda c/llama2q_cuda.c -lcudart -lm
 
 # the most basic way of building that is most likely to work on most systems
-cdebug: c/run.c c/runq.c c/runv.c c/runqv.c
-	$(CC) -O3 -g -o c/run c/run.c -lm
-	$(CC) -O3 -g -o c/runq c/runq.c -lm
-	$(CC) -O3 -g -o c/runv c/runv.c -lm
-	$(CC) -O3 -g -o c/runqv c/runqv.c -lm
+cdebug: c/llama2_cpu.c c/llama2q_cpu.c c/llama2_cpuv.c c/llama2q_cpuv.c c/llama2_cuda.c c/llama2q_cuda.c
+	$(CC) -O3 -g -o c/llama2_cpu c/llama2_cpu.c -lm
+	$(CC) -O3 -g -o c/llama2q_cpu c/llama2q_cpu.c -lm
+	$(CC) -O3 -g -o c/llama2_cpuv c/llama2_cpuv.c -lm
+	$(CC) -O3 -g -o c/llama2q_cpuv c/llama2q_cpuv.c -lm
+	$(CUDA) -x cu -O0 -g -arch=native -o c/llama2_cuda c/llama2_cuda.c -lcudart -lm
+	$(CUDA) -x cu -O0 -g -arch=native -o c/llama2q_cuda c/llama2q_cuda.c -lcudart -lm
 
 
 crun: c
-	c/run
-	c/runq
-	c/runv
-	c/runqv
-	LLAMA2_KERNEL=scalar c/runv
-	LLAMA2_KERNEL=avx2 c/runv
-	LLAMA2_KERNEL=avx512 c/runv
-	LLAMA2_KERNEL=scalar c/runqv
-	LLAMA2_KERNEL=avx2 c/runqv
-	LLAMA2_KERNEL=avx512 c/runqv
+	c/llama2_cpu
+	c/llama2q_cpu
+	c/llama2_cpuv
+	c/llama2q_cpuv
+	LLAMA2_KERNEL=scalar c/llama2_cpuv
+	LLAMA2_KERNEL=avx2   c/llama2_cpuv
+	LLAMA2_KERNEL=avx512 c/llama2_cpuv
+	LLAMA2_KERNEL=scalar c/llama2q_cpuv
+	LLAMA2_KERNEL=avx2   c/llama2q_cpuv
+	LLAMA2_KERNEL=avx512 c/llama2q_cpuv
+	c/llama2_cuda
+	c/llama2q_cuda
 
 # bit-exactness / near-exactness checks for the GEMV kernels (scalar/avx2/avx512).
 # Both tests carry the kernels as copies of the ones in c/runv.c / c/runqv.c and
@@ -64,25 +58,25 @@ zdebug:
 	cd zig && zig build
 
 zrun: z
-	zig/zig-out/bin/llama2
-	zig/zig-out/bin/llama2q
-	zig/zig-out/bin/llama2v
-	zig/zig-out/bin/llama2qv
-	LLAMA2_KERNEL=scalar zig/zig-out/bin/llama2v
-	LLAMA2_KERNEL=avx2 zig/zig-out/bin/llama2v
-	LLAMA2_KERNEL=avx512 zig/zig-out/bin/llama2v
-	LLAMA2_KERNEL=scalar zig/zig-out/bin/llama2qv
-	LLAMA2_KERNEL=avx2 zig/zig-out/bin/llama2qv
-	LLAMA2_KERNEL=avx512 zig/zig-out/bin/llama2qv
+	zig/zig-out/bin/llama2_cpu
+	zig/zig-out/bin/llama2q_cpu
+	zig/zig-out/bin/llama2_cpuv
+	zig/zig-out/bin/llama2q_cpuv
+	LLAMA2_KERNEL=scalar zig/zig-out/bin/llama2_cpuv
+	LLAMA2_KERNEL=avx2   zig/zig-out/bin/llama2_cpuv
+	LLAMA2_KERNEL=avx512 zig/zig-out/bin/llama2_cpuv
+	LLAMA2_KERNEL=scalar zig/zig-out/bin/llama2q_cpuv
+	LLAMA2_KERNEL=avx2   zig/zig-out/bin/llama2q_cpuv
+	LLAMA2_KERNEL=avx512 zig/zig-out/bin/llama2q_cpuv
 
 .PHONY: clean
 clean:
-	rm -f c/run
-	rm -f c/runq
-	rm -f c/runv
-	rm -f c/runqv
-	rm -f c/runcuda
-	rm -f c/runqcuda
+	rm -f c/llama2_cpu
+	rm -f c/llama2q_cpu
+	rm -f c/llama2_cpuv
+	rm -f c/llama2q_cpuv
+	rm -f c/llama2_cuda
+	rm -f c/llama2q_cuda
 	rm -f c/test_matmul
 	rm -f c/test_fp32
 	rm -rf zig/zig-out

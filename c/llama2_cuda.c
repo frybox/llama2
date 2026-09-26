@@ -2,7 +2,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
-#include <stdint.h>
 #include <time.h>
 #include <math.h>
 #include <string.h>
@@ -25,9 +24,6 @@
 } while (0)
 
 
-int GS = 0;
-
-
 typedef struct {
   int dim;
   int ffndim;
@@ -40,24 +36,17 @@ typedef struct {
 
 
 typedef struct {
-  int8_t *q;
-  float *s;
-} QuantizedTensor;
-
-
-typedef struct {
-  QuantizedTensor *q_tokens;
   float *embeddings;
   float *wrmsattn;
   float *wrmsffn;
   float *wrmsfinal;
-  QuantizedTensor *wq;
-  QuantizedTensor *wk;
-  QuantizedTensor *wv;
-  QuantizedTensor *wo;
-  QuantizedTensor *w1;
-  QuantizedTensor *w2;
-  QuantizedTensor *w3;
+  float *wq;
+  float *wk;
+  float *wv;
+  float *wo;
+  float *w1;
+  float *w2;
+  float *w3;
 } Weights;
 
 
@@ -82,6 +71,18 @@ typedef struct {
   int fd;
   float *data;
   ssize_t fsize;
+  // device weights
+  float *dev_embeddings;
+  float *dev_wrmsattn;
+  float *dev_wrmsffn;
+  float *dev_wrmsfinal;
+  float *dev_wq;
+  float *dev_wk;
+  float *dev_wv;
+  float *dev_wo;
+  float *dev_w1;
+  float *dev_w2;
+  float *dev_w3;
   // device state
   float *dev_x;
   float *dev_x1;
@@ -93,31 +94,6 @@ typedef struct {
   float *dev_logits;
   float *dev_kcache;
   float *dev_vcache;
-  int8_t *dev_xq_q;
-  float *dev_xq_s;
-  int8_t *dev_hq_q;
-  float *dev_hq_s;
-  // device weights
-  float *dev_embeddings;
-  float *dev_wrmsattn;
-  float *dev_wrmsffn;
-  float *dev_wrmsfinal;
-  int8_t *dev_wq;
-  float *dev_wq_s;
-  int8_t *dev_wk;
-  float *dev_wk_s;
-  int8_t *dev_wv;
-  float *dev_wv_s;
-  int8_t *dev_wo;
-  float *dev_wo_s;
-  int8_t *dev_w1;
-  float *dev_w1_s;
-  int8_t *dev_w2;
-  float *dev_w2_s;
-  int8_t *dev_w3;
-  float *dev_w3_s;
-  int8_t *dev_qtok;
-  float *dev_qtok_s;
 } Transformer;
 
 
@@ -147,10 +123,6 @@ void malloc_state(Transformer *tr, State *s, Config *c) {
   CUDA_CHECK(cudaMalloc(&s->logits, sizeof(float) * c->nvocab));
   CUDA_CHECK(cudaMalloc(&s->kcache, sizeof(float) * (size_t)c->nlayers * c->ncontext * kvdim));
   CUDA_CHECK(cudaMalloc(&s->vcache, sizeof(float) * (size_t)c->nlayers * c->ncontext * kvdim));
-  CUDA_CHECK(cudaMalloc(&tr->dev_xq_q, sizeof(int8_t) * dim));
-  CUDA_CHECK(cudaMalloc(&tr->dev_xq_s, sizeof(float) * dim / GS));
-  CUDA_CHECK(cudaMalloc(&tr->dev_hq_q, sizeof(int8_t) * ffndim));
-  CUDA_CHECK(cudaMalloc(&tr->dev_hq_s, sizeof(float) * ffndim / GS));
   if (!s->x || !s->x1 || !s->x2 || !s->h || !s->h1 || !s->q ||
       !s->attn || !s->logits || !s->kcache || !s->vcache) {
     mexit("cudaMalloc state failed!");
@@ -168,7 +140,7 @@ void malloc_state(Transformer *tr, State *s, Config *c) {
 }
 
 
-void free_state(Transformer *tr, State *s) {
+void free_state(State *s) {
   cudaFree(s->x);
   cudaFree(s->x1);
   cudaFree(s->x2);
@@ -179,127 +151,51 @@ void free_state(Transformer *tr, State *s) {
   cudaFree(s->logits);
   cudaFree(s->kcache);
   cudaFree(s->vcache);
-  cudaFree(tr->dev_xq_q);
-  cudaFree(tr->dev_xq_s);
-  cudaFree(tr->dev_hq_q);
-  cudaFree(tr->dev_hq_s);
 }
 
 
-// pull x from the device, quantize on the host, push the result back
-void quantize_upload(Transformer *tr, const float *dx, int n,
-                     int8_t **dq, float **ds) {
-  float hostbuf[8192];
-  int8_t hq[8192];
-  float hs[8192 / GS];
-  if (n > (int)(sizeof(hostbuf) / sizeof(float))) mexit("quantize_upload: n too big");
-  CUDA_CHECK(cudaMemcpy(hostbuf, dx, sizeof(float) * n, cudaMemcpyDeviceToHost));
-  QuantizedTensor t = { .q = hq, .s = hs };
-  int ngroups = n / GS;
-  float Q_MAX = 127.0f;
-  for (int g = 0; g < ngroups; g++) {
-    float *px = hostbuf + g * GS;
-    int8_t *pq = t.q + g * GS;
-    float max = 0.0f;
-    for (int i = 0; i < GS; i++) {
-      float v = fabsf(px[i]);
-      if (v > max) max = v;
-    }
-    float s = max / Q_MAX;
-    for (int i = 0; i < GS; i++) {
-      pq[i] = (int8_t)roundf(px[i] / s);
-    }
-    t.s[g] = s;
-  }
-  CUDA_CHECK(cudaMemcpy(*dq, t.q, sizeof(int8_t) * n, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(*ds, t.s, sizeof(float) * n / GS, cudaMemcpyHostToDevice));
-}
-
-
-QuantizedTensor *init_quantized_tensors(void **ptr, int n, int size_each) {
-  void *p = *ptr;
-  QuantizedTensor *qts = (QuantizedTensor*)malloc(n * sizeof(QuantizedTensor));
-  for (int i = 0; i < n; i++) {
-    qts[i].q = (int8_t*)p;
-    p = (int8_t*)p + size_each;
-    qts[i].s = (float*)p;
-    p = (float*)p + size_each / GS;
-  }
-  *ptr = p;
-  return qts;
-}
-
-
-void mmap_weights(Weights *w, Config *c, void *ptr) {
-  int dim = c->dim;
-  int ffndim = c->ffndim;
-  int head_size = dim / c->nheads;
+void mmap_weights(Weights *w, Config *c, float *p) {
+  int head_size = c->dim / c->nheads;
   int kvdim = head_size * c->nkvheads;
   unsigned long long nlayers = c->nlayers;
-  float *fp = (float*)ptr;
-  w->wrmsattn = fp;
-  fp += nlayers * c->dim;
-  w->wrmsffn = fp;
-  fp += nlayers * c->dim;
-  w->wrmsfinal = fp;
-  fp += c->dim;
-
-  ptr = (void*)fp;
-  w->q_tokens = init_quantized_tensors(&ptr, 1, c->nvocab * c->dim);
-  w->embeddings = (float*)malloc(c->nvocab * dim * sizeof(float));
-  for (int i = 0; i < c->nvocab * dim; i++) {
-    w->embeddings[i] = w->q_tokens->q[i] * w->q_tokens->s[i / GS];
-  }
-  w->wq = init_quantized_tensors(&ptr, c->nlayers, dim * dim);
-  w->wk = init_quantized_tensors(&ptr, c->nlayers, dim * kvdim);
-  w->wv = init_quantized_tensors(&ptr, c->nlayers, dim * kvdim);
-  w->wo = init_quantized_tensors(&ptr, c->nlayers, dim * dim);
-  w->w1 = init_quantized_tensors(&ptr, c->nlayers, dim * ffndim);
-  w->w2 = init_quantized_tensors(&ptr, c->nlayers, ffndim * dim);
-  w->w3 = init_quantized_tensors(&ptr, c->nlayers, dim * ffndim);
+  w->embeddings = p;
+  p += c->nvocab * c->dim;
+  w->wrmsattn = p;
+  p += nlayers * c->dim;
+  w->wq = p;
+  p += nlayers * c->dim * c->dim;
+  w->wk = p;
+  p += nlayers * c->dim * kvdim;
+  w->wv = p;
+  p += nlayers * c->dim * kvdim;
+  w->wo = p;
+  p += nlayers * c->dim * c->dim;
+  w->wrmsffn = p;
+  p += nlayers * c->dim;
+  w->w1 = p;
+  p += nlayers * c->dim * c->ffndim;
+  w->w2 = p;
+  p += nlayers * c->ffndim * c->dim;
+  w->w3 = p;
+  p += nlayers * c->dim * c->ffndim;
+  w->wrmsfinal = p;
+  p += c->dim;
 }
 
 
 void read_checkpoint(char *path, Config *c, Weights *w, int *fd, float **data, ssize_t *fsize) {
   FILE *f = fopen(path, "rb");
   if (!f) { mexit("Can't open file"); }
-  uint32_t magic_number;
-  if (fread(&magic_number, sizeof(uint32_t), 1, f) != 1) {
-    fexit(f, "Can't read checkpoint magic number");
-  }
-  if (magic_number != 0x616b3432) {
-    fexit(f, "Bad magic number");
-  }
-  int version;
-  if (fread(&version, sizeof(int), 1, f) != 1) {
-    fexit(f, "Can't read checkpoint version");
-  }
-  if (version != 2) {
-    fexit(f, "version should be 2");
-  }
-  if (fread(c, sizeof(Config), 1, f) != 1) {
-    fexit(f, "Can't read checkpoint config");
-  }
+  if (fread(c, sizeof(*c), 1, f) != 1) { fexit(f, "Invalid file"); }
   c->nvocab = abs(c->nvocab);
-  uint8_t shared_classifier;
-  if (fread(&shared_classifier, sizeof(uint8_t), 1, f) != 1) {
-    fexit(f, "Can't read shared classifier");
-  }
-  int group_size;
-  if (fread(&group_size, sizeof(int), 1, f) != 1) {
-    fexit(f, "Can't read group size");
-  }
-  GS = group_size;
   fseek(f, 0, SEEK_END);
   *fsize = ftell(f);
   fclose(f);
-
-  int header_size = 256;
   *fd = open(path, O_RDONLY);
-  if (*fd == -1) { mexit("open checkpoint file failed!"); }
+  if (*fd == -1) { mexit("open failed!"); }
   *data = (float*)mmap(NULL, *fsize, PROT_READ, MAP_PRIVATE, *fd, 0);
   if (*data == MAP_FAILED) { mexit("mmap failed!"); }
-  void *weights = ((char*)*data) + header_size;
+  float *weights = *data + sizeof(Config)/sizeof(float);
   mmap_weights(w, c, weights);
 }
 
@@ -310,51 +206,32 @@ void upload_weights(Transformer *tr) {
   int ffndim = c->ffndim;
   int head_size = dim / c->nheads;
   int kvdim = head_size * c->nkvheads;
-  unsigned long long nlayers = c->nlayers;
   size_t dim2 = (size_t)dim * dim;
   size_t dimkv = (size_t)dim * kvdim;
   size_t dimff = (size_t)dim * ffndim;
   size_t ffn_dim = (size_t)ffndim * dim;
   CUDA_CHECK(cudaMalloc(&tr->dev_embeddings, sizeof(float) * (size_t)c->nvocab * dim));
-  CUDA_CHECK(cudaMalloc(&tr->dev_wrmsattn, sizeof(float) * (size_t)nlayers * dim));
-  CUDA_CHECK(cudaMalloc(&tr->dev_wrmsffn, sizeof(float) * (size_t)nlayers * dim));
+  CUDA_CHECK(cudaMalloc(&tr->dev_wrmsattn, sizeof(float) * (size_t)c->nlayers * dim));
+  CUDA_CHECK(cudaMalloc(&tr->dev_wrmsffn, sizeof(float) * (size_t)c->nlayers * dim));
   CUDA_CHECK(cudaMalloc(&tr->dev_wrmsfinal, sizeof(float) * dim));
-  CUDA_CHECK(cudaMalloc(&tr->dev_wq, sizeof(int8_t) * (size_t)nlayers * dim2));
-  CUDA_CHECK(cudaMalloc(&tr->dev_wq_s, sizeof(float) * (size_t)nlayers * dim2 / GS));
-  CUDA_CHECK(cudaMalloc(&tr->dev_wk, sizeof(int8_t) * (size_t)nlayers * dimkv));
-  CUDA_CHECK(cudaMalloc(&tr->dev_wk_s, sizeof(float) * (size_t)nlayers * dimkv / GS));
-  CUDA_CHECK(cudaMalloc(&tr->dev_wv, sizeof(int8_t) * (size_t)nlayers * dimkv));
-  CUDA_CHECK(cudaMalloc(&tr->dev_wv_s, sizeof(float) * (size_t)nlayers * dimkv / GS));
-  CUDA_CHECK(cudaMalloc(&tr->dev_wo, sizeof(int8_t) * (size_t)nlayers * dim2));
-  CUDA_CHECK(cudaMalloc(&tr->dev_wo_s, sizeof(float) * (size_t)nlayers * dim2 / GS));
-  CUDA_CHECK(cudaMalloc(&tr->dev_w1, sizeof(int8_t) * (size_t)nlayers * dimff));
-  CUDA_CHECK(cudaMalloc(&tr->dev_w1_s, sizeof(float) * (size_t)nlayers * dimff / GS));
-  CUDA_CHECK(cudaMalloc(&tr->dev_w2, sizeof(int8_t) * (size_t)nlayers * ffn_dim));
-  CUDA_CHECK(cudaMalloc(&tr->dev_w2_s, sizeof(float) * (size_t)nlayers * ffn_dim / GS));
-  CUDA_CHECK(cudaMalloc(&tr->dev_w3, sizeof(int8_t) * (size_t)nlayers * dimff));
-  CUDA_CHECK(cudaMalloc(&tr->dev_w3_s, sizeof(float) * (size_t)nlayers * dimff / GS));
-  CUDA_CHECK(cudaMalloc(&tr->dev_qtok, sizeof(int8_t) * (size_t)c->nvocab * dim));
-  CUDA_CHECK(cudaMalloc(&tr->dev_qtok_s, sizeof(float) * (size_t)c->nvocab * dim / GS));
+  CUDA_CHECK(cudaMalloc(&tr->dev_wq, sizeof(float) * (size_t)c->nlayers * dim2));
+  CUDA_CHECK(cudaMalloc(&tr->dev_wk, sizeof(float) * (size_t)c->nlayers * dimkv));
+  CUDA_CHECK(cudaMalloc(&tr->dev_wv, sizeof(float) * (size_t)c->nlayers * dimkv));
+  CUDA_CHECK(cudaMalloc(&tr->dev_wo, sizeof(float) * (size_t)c->nlayers * dim2));
+  CUDA_CHECK(cudaMalloc(&tr->dev_w1, sizeof(float) * (size_t)c->nlayers * dimff));
+  CUDA_CHECK(cudaMalloc(&tr->dev_w2, sizeof(float) * (size_t)c->nlayers * ffn_dim));
+  CUDA_CHECK(cudaMalloc(&tr->dev_w3, sizeof(float) * (size_t)c->nlayers * dimff));
   CUDA_CHECK(cudaMemcpy(tr->dev_embeddings, tr->w.embeddings, sizeof(float) * (size_t)c->nvocab * dim, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_wrmsattn, tr->w.wrmsattn, sizeof(float) * (size_t)nlayers * dim, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_wrmsffn, tr->w.wrmsffn, sizeof(float) * (size_t)nlayers * dim, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(tr->dev_wrmsattn, tr->w.wrmsattn, sizeof(float) * (size_t)c->nlayers * dim, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(tr->dev_wq, tr->w.wq, sizeof(float) * (size_t)c->nlayers * dim2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(tr->dev_wk, tr->w.wk, sizeof(float) * (size_t)c->nlayers * dimkv, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(tr->dev_wv, tr->w.wv, sizeof(float) * (size_t)c->nlayers * dimkv, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(tr->dev_wo, tr->w.wo, sizeof(float) * (size_t)c->nlayers * dim2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(tr->dev_wrmsffn, tr->w.wrmsffn, sizeof(float) * (size_t)c->nlayers * dim, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(tr->dev_w1, tr->w.w1, sizeof(float) * (size_t)c->nlayers * dimff, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(tr->dev_w2, tr->w.w2, sizeof(float) * (size_t)c->nlayers * ffn_dim, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(tr->dev_w3, tr->w.w3, sizeof(float) * (size_t)c->nlayers * dimff, cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(tr->dev_wrmsfinal, tr->w.wrmsfinal, sizeof(float) * dim, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_wq, tr->w.wq[0].q, sizeof(int8_t) * (size_t)nlayers * dim2, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_wq_s, tr->w.wq[0].s, sizeof(float) * (size_t)nlayers * dim2 / GS, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_wk, tr->w.wk[0].q, sizeof(int8_t) * (size_t)nlayers * dimkv, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_wk_s, tr->w.wk[0].s, sizeof(float) * (size_t)nlayers * dimkv / GS, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_wv, tr->w.wv[0].q, sizeof(int8_t) * (size_t)nlayers * dimkv, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_wv_s, tr->w.wv[0].s, sizeof(float) * (size_t)nlayers * dimkv / GS, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_wo, tr->w.wo[0].q, sizeof(int8_t) * (size_t)nlayers * dim2, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_wo_s, tr->w.wo[0].s, sizeof(float) * (size_t)nlayers * dim2 / GS, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_w1, tr->w.w1[0].q, sizeof(int8_t) * (size_t)nlayers * dimff, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_w1_s, tr->w.w1[0].s, sizeof(float) * (size_t)nlayers * dimff / GS, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_w2, tr->w.w2[0].q, sizeof(int8_t) * (size_t)nlayers * ffn_dim, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_w2_s, tr->w.w2[0].s, sizeof(float) * (size_t)nlayers * ffn_dim / GS, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_w3, tr->w.w3[0].q, sizeof(int8_t) * (size_t)nlayers * dimff, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_w3_s, tr->w.w3[0].s, sizeof(float) * (size_t)nlayers * dimff / GS, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_qtok, tr->w.q_tokens->q, sizeof(int8_t) * (size_t)c->nvocab * dim, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_qtok_s, tr->w.q_tokens->s, sizeof(float) * (size_t)c->nvocab * dim / GS, cudaMemcpyHostToDevice));
 }
 
 
@@ -365,43 +242,25 @@ void build_transformer(Transformer *tr, char *path) {
 }
 
 
-void free_transformer(Transformer *tr) {
+void  free_transformer(Transformer *tr) {
   cudaFree(tr->dev_embeddings);
   cudaFree(tr->dev_wrmsattn);
   cudaFree(tr->dev_wrmsffn);
   cudaFree(tr->dev_wrmsfinal);
   cudaFree(tr->dev_wq);
-  cudaFree(tr->dev_wq_s);
   cudaFree(tr->dev_wk);
-  cudaFree(tr->dev_wk_s);
   cudaFree(tr->dev_wv);
-  cudaFree(tr->dev_wv_s);
   cudaFree(tr->dev_wo);
-  cudaFree(tr->dev_wo_s);
   cudaFree(tr->dev_w1);
-  cudaFree(tr->dev_w1_s);
   cudaFree(tr->dev_w2);
-  cudaFree(tr->dev_w2_s);
   cudaFree(tr->dev_w3);
-  cudaFree(tr->dev_w3_s);
-  cudaFree(tr->dev_qtok);
-  cudaFree(tr->dev_qtok_s);
-  free(tr->w.q_tokens);
-  free(tr->w.embeddings);
-  free(tr->w.wq);
-  free(tr->w.wk);
-  free(tr->w.wv);
-  free(tr->w.wo);
-  free(tr->w.w1);
-  free(tr->w.w2);
-  free(tr->w.w3);
   if (tr->data != MAP_FAILED) {
     munmap(tr->data, tr->fsize);
   }
   if (tr->fd != -1) {
     close(tr->fd);
   }
-  free_state(tr, &tr->s);
+  free_state(&tr->s);
 }
 
 
@@ -460,6 +319,29 @@ void rmsnorm(float *o, float *x, float *w, int size) {
 }
 
 
+// out[i] = sum_j w[i*n + j] * x[j]; one block per output row, n elements
+__global__ void matmul_kernel(float *o, const float *w, const float *x, int n, int d) {
+  extern __shared__ float red[];
+  int i = blockIdx.x;
+  const float *wi = w + (size_t)i * n;
+  float v = 0.0f;
+  for (int j = threadIdx.x; j < n; j += blockDim.x) {
+    v += wi[j] * x[j];
+  }
+  red[threadIdx.x] = v;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      red[threadIdx.x] += red[threadIdx.x + s];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    o[i] = red[0];
+  }
+}
+
+
 // softmax in place; reductions done on the host (sizes are small here)
 void softmax(float *x, int size) {
   float hostbuf[8192];
@@ -485,42 +367,7 @@ void softmax(float *x, int size) {
 }
 
 
-
-
-// out[i] = sum_g (sum_k wq[in+j+k]*xq[j+k]) * ws[(in+j)/GS] * xs[j/GS]
-// one block per output row; n and d must be divisible by GS
-__global__ void qmatmul_kernel(float *o, const int8_t *wq, const float *ws,
-                              const int8_t *xq, const float *xs, int n, int d, int gs) {
-  extern __shared__ float red[];
-  int i = blockIdx.x;
-  int nfull = (n / gs) * gs; // same as the CPU reference: remainder groups are skipped
-  float v = 0.0f;
-  for (int j = threadIdx.x * gs; j < nfull; j += blockDim.x * gs) {
-    int in = i * n;
-    int32_t iv = 0;
-    for (int k = 0; k < gs; k++) {
-      iv += (int32_t)wq[in + j + k] * (int32_t)xq[j + k];
-    }
-    v += (float)iv * ws[(in + j) / gs] * xs[j / gs];
-  }
-  red[threadIdx.x] = v;
-  __syncthreads();
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (threadIdx.x < s) {
-      red[threadIdx.x] += red[threadIdx.x + s];
-    }
-    __syncthreads();
-  }
-  if (threadIdx.x == 0) {
-    float sum = 0.0f;
-    for (int t = 0; t < blockDim.x; t++) {
-      sum += red[t];
-    }
-    o[i] = sum;
-  }
-}
-
-
+// o[i] += x[i]
 __global__ void axpy_kernel(float *o, const float *x, int n) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < n) {
@@ -529,6 +376,7 @@ __global__ void axpy_kernel(float *o, const float *x, int n) {
 }
 
 
+// SiLU(gate) * up, elementwise in place
 __global__ void silu_mul_kernel(float *h, const float *h1, int n) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < n) {
@@ -539,6 +387,8 @@ __global__ void silu_mul_kernel(float *h, const float *h1, int n) {
 }
 
 
+// apply rotary embeddings to q (and to k for the first kvdim/2 pairs),
+// one thread per pair (2i, 2i+1)
 __global__ void rope_kernel(float *q, float *k, int dim, int kvdim, int hsize, int pos) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i * 2 >= dim) return;
@@ -558,12 +408,13 @@ __global__ void rope_kernel(float *q, float *k, int dim, int kvdim, int hsize, i
 }
 
 
+// attn[h][t] = dot(q_head, k_head) / sqrt(hsize); one block per (head, t)
 __global__ void attn_score_kernel(float *attn, const float *q, const float *kcache, int nheads, int pos, int hsize, int kvdim, int kvmul) {
   extern __shared__ float red[];
   int h = blockIdx.x;
   int t = blockIdx.y;
   const float *qh = q + h * hsize;
-  const float *kh = kcache + (size_t)t * kvdim + (h / kvmul) * hsize;
+  const float *kh = kcache + t * kvdim + (h / kvmul) * hsize;
   float v = 0.0f;
   for (int i = threadIdx.x; i < hsize; i += blockDim.x) {
     v += qh[i] * kh[i];
@@ -577,20 +428,17 @@ __global__ void attn_score_kernel(float *attn, const float *q, const float *kcac
     __syncthreads();
   }
   if (threadIdx.x == 0) {
-    float sum = 0.0f;
-    for (int i2 = 0; i2 < blockDim.x; i2++) {
-      sum += red[i2];
-    }
-    attn[(size_t)h * (pos + 1) + t] = sum / sqrtf((float)hsize);
+    attn[h * (pos + 1) + t] = red[0] / sqrtf((float)hsize);
   }
 }
 
 
+// x1[head, i] = sum_t attn[h][t] * v[head, t, i]; one block per head
 __global__ void attn_value_kernel(float *x1, const float *attn, const float *vcache, int nheads, int pos, int hsize, int kvdim, int kvmul) {
   extern __shared__ float red[];
   int h = blockIdx.x;
   int i = blockIdx.y;
-  const float *ah = attn + (size_t)h * (pos + 1);
+  const float *ah = attn + h * (pos + 1);
   float v = 0.0f;
   for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
     v += ah[t] * vcache[(size_t)t * kvdim + (h / kvmul) * hsize + i];
@@ -604,77 +452,66 @@ __global__ void attn_value_kernel(float *x1, const float *attn, const float *vca
     __syncthreads();
   }
   if (threadIdx.x == 0) {
-    float sum = 0.0f;
-    for (int i2 = 0; i2 < blockDim.x; i2++) {
-      sum += red[i2];
-    }
-    x1[h * hsize + i] = sum;
+    x1[h * hsize + i] = red[0];
   }
 }
 
 
 float *forward(Transformer *tr, int token, int pos) {
   Config *c = &tr->c;
-  float *x = tr->dev_x;
+  Weights *w = &tr->w;
+  State *s = &tr->s;
+  float *x = s->x;
   int dim = c->dim;
   int kvdim = dim * c->nkvheads / c->nheads;
   int kvmul = c->nheads / c->nkvheads;
   int ffndim = c->ffndim;
   int hsize = dim / c->nheads;
   int threads = 256;
-  size_t dim2 = (size_t)dim * dim;
-  size_t dimkv = (size_t)dim * kvdim;
-  size_t dimff = (size_t)dim * ffndim;
-  size_t ffn_dim = (size_t)ffndim * dim;
 
   {
-    float *content = tr->dev_embeddings + (size_t)token * dim;
-    CUDA_CHECK(cudaMemcpy(x, content, sizeof(float) * dim, cudaMemcpyDeviceToDevice));
+    float *content = tr->w.embeddings + (size_t)token * dim;
+    CUDA_CHECK(cudaMemcpy(x, content, sizeof(float) * dim, cudaMemcpyHostToDevice));
   }
 
   for (unsigned long long l = 0; l < c->nlayers; l++) {
     // 1. self-attention sublayer
-    rmsnorm(tr->dev_x1, x, tr->dev_wrmsattn + l * dim, dim);
-    float *k = tr->dev_kcache + l * (size_t)c->ncontext * kvdim + pos * kvdim;
-    float *v = tr->dev_vcache + l * (size_t)c->ncontext * kvdim + pos * kvdim;
-    quantize_upload(tr, tr->dev_x1, dim, &tr->dev_xq_q, &tr->dev_xq_s);
-    qmatmul_kernel<<<dim, threads, threads * sizeof(float)>>>(tr->dev_q, tr->dev_wq + l * dim2, tr->dev_wq_s + l * dim2 / GS, tr->dev_xq_q, tr->dev_xq_s, dim, dim, GS);
-    qmatmul_kernel<<<kvdim, threads, threads * sizeof(float)>>>(k, tr->dev_wk + l * dimkv, tr->dev_wk_s + l * dimkv / GS, tr->dev_xq_q, tr->dev_xq_s, dim, kvdim, GS);
-    qmatmul_kernel<<<kvdim, threads, threads * sizeof(float)>>>(v, tr->dev_wv + l * dimkv, tr->dev_wv_s + l * dimkv / GS, tr->dev_xq_q, tr->dev_xq_s, dim, kvdim, GS);
+    rmsnorm(s->x1, x, tr->dev_wrmsattn + l * dim, dim);
+    float *k = s->kcache + l * (size_t)c->ncontext * kvdim + pos * kvdim;
+    float *v = s->vcache + l * (size_t)c->ncontext * kvdim + pos * kvdim;
+    matmul_kernel<<<dim, threads, threads * sizeof(float)>>>(s->q, tr->dev_wq + l * (size_t)dim * dim, s->x1, dim, dim);
+    matmul_kernel<<<kvdim, threads, threads * sizeof(float)>>>(k, tr->dev_wk + l * (size_t)dim * kvdim, s->x1, dim, kvdim);
+    matmul_kernel<<<kvdim, threads, threads * sizeof(float)>>>(v, tr->dev_wv + l * (size_t)dim * kvdim, s->x1, dim, kvdim);
     {
       dim3 blocks(dim / 2);
-      rope_kernel<<<blocks, threads>>>(tr->dev_q, k, dim, kvdim, hsize, pos);
+      rope_kernel<<<blocks, threads>>>(s->q, k, dim, kvdim, hsize, pos);
     }
     {
       dim3 blocks(c->nheads, pos + 1);
-      attn_score_kernel<<<blocks, threads, threads * sizeof(float)>>>(tr->dev_attn, tr->dev_q, tr->dev_kcache + l * (size_t)c->ncontext * kvdim, c->nheads, pos, hsize, kvdim, kvmul);
+      attn_score_kernel<<<blocks, threads, threads * sizeof(float)>>>(s->attn, s->q, s->kcache + l * (size_t)c->ncontext * kvdim, c->nheads, pos, hsize, kvdim, kvmul);
     }
     for (int h = 0; h < c->nheads; h++) {
-      softmax(tr->dev_attn + h * (pos + 1), pos + 1);
+      softmax(s->attn + h * (pos + 1), pos + 1);
     }
     {
       dim3 blocks(c->nheads, hsize);
-      attn_value_kernel<<<blocks, threads, threads * sizeof(float)>>>(tr->dev_x1, tr->dev_attn, tr->dev_vcache + l * (size_t)c->ncontext * kvdim, c->nheads, pos, hsize, kvdim, kvmul);
+      attn_value_kernel<<<blocks, threads, threads * sizeof(float)>>>(s->x1, s->attn, s->vcache + l * (size_t)c->ncontext * kvdim, c->nheads, pos, hsize, kvdim, kvmul);
     }
-    quantize_upload(tr, tr->dev_x1, dim, &tr->dev_xq_q, &tr->dev_xq_s);
-    qmatmul_kernel<<<dim, threads, threads * sizeof(float)>>>(tr->dev_x2, tr->dev_wo + l * dim2, tr->dev_wo_s + l * dim2 / GS, tr->dev_xq_q, tr->dev_xq_s, dim, dim, GS);
-    axpy_kernel<<<(dim + threads - 1) / threads, threads>>>(x, tr->dev_x2, dim);
+    matmul_kernel<<<dim, threads, threads * sizeof(float)>>>(s->x2, tr->dev_wo + l * (size_t)dim * dim, s->x1, dim, dim);
+    axpy_kernel<<<(dim + threads - 1) / threads, threads>>>(x, s->x2, dim);
 
     // 2. ffn sublayer
-    rmsnorm(tr->dev_x1, x, tr->dev_wrmsffn + l * dim, dim);
-    quantize_upload(tr, tr->dev_x1, dim, &tr->dev_xq_q, &tr->dev_xq_s);
-    qmatmul_kernel<<<ffndim, threads, threads * sizeof(float)>>>(tr->dev_h, tr->dev_w1 + l * dimff, tr->dev_w1_s + l * dimff / GS, tr->dev_xq_q, tr->dev_xq_s, dim, ffndim, GS);
-    qmatmul_kernel<<<ffndim, threads, threads * sizeof(float)>>>(tr->dev_h1, tr->dev_w3 + l * dimff, tr->dev_w3_s + l * dimff / GS, tr->dev_xq_q, tr->dev_xq_s, dim, ffndim, GS);
-    silu_mul_kernel<<<(ffndim + threads - 1) / threads, threads>>>(tr->dev_h, tr->dev_h1, ffndim);
-    quantize_upload(tr, tr->dev_h, ffndim, &tr->dev_hq_q, &tr->dev_hq_s);
-    qmatmul_kernel<<<dim, threads, threads * sizeof(float)>>>(tr->dev_x1, tr->dev_w2 + l * ffn_dim, tr->dev_w2_s + l * ffn_dim / GS, tr->dev_hq_q, tr->dev_hq_s, ffndim, dim, GS);
-    axpy_kernel<<<(dim + threads - 1) / threads, threads>>>(x, tr->dev_x1, dim);
+    rmsnorm(s->x1, x, tr->dev_wrmsffn + l * dim, dim);
+    matmul_kernel<<<ffndim, threads, threads * sizeof(float)>>>(s->h, tr->dev_w1 + l * (size_t)dim * ffndim, s->x1, dim, ffndim);
+    matmul_kernel<<<ffndim, threads, threads * sizeof(float)>>>(s->h1, tr->dev_w3 + l * (size_t)dim * ffndim, s->x1, dim, ffndim);
+    silu_mul_kernel<<<(ffndim + threads - 1) / threads, threads>>>(s->h, s->h1, ffndim);
+    matmul_kernel<<<dim, threads, threads * sizeof(float)>>>(s->x1, tr->dev_w2 + l * (size_t)ffndim * dim, s->h, ffndim, dim);
+    axpy_kernel<<<(dim + threads - 1) / threads, threads>>>(x, s->x1, dim);
   }
 
   rmsnorm(x, x, tr->dev_wrmsfinal, dim);
-  quantize_upload(tr, x, dim, &tr->dev_xq_q, &tr->dev_xq_s);
-  qmatmul_kernel<<<c->nvocab, threads, threads * sizeof(float)>>>(tr->dev_logits, tr->dev_qtok, tr->dev_qtok_s, tr->dev_xq_q, tr->dev_xq_s, dim, c->nvocab, GS);
-  return tr->dev_logits;
+  matmul_kernel<<<c->nvocab, threads, threads * sizeof(float)>>>(s->logits, tr->dev_embeddings, x, dim, c->nvocab);
+  return s->logits;
 }
 
 
@@ -966,6 +803,8 @@ long time_in_ms() {
 }
 
 
+static int dump_done = 0;
+
 void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
   char *empty_prompt = "";
   if (!prompt) prompt = empty_prompt;
@@ -983,6 +822,11 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
   while (pos < steps) {
     float *logits = forward(transformer, token, pos);
     CUDA_CHECK(cudaMemcpy(host_logits, logits, sizeof(float) * transformer->c.nvocab, cudaMemcpyDeviceToHost));
+    if (pos == 0 && getenv("CUDADUMP") && !dump_done) {
+      dump_done = 1;
+      for (int i = 0; i < 12; i++) fprintf(stderr, "CUDALOGIT %.6f ", host_logits[i]);
+      fprintf(stderr, "\n");
+    }
     if (pos < num_prompt_tokens - 1) {
       next = prompt_tokens[pos + 1];
     } else {
@@ -999,7 +843,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
   printf("\n");
   if (pos > 1) {
     long end = time_in_ms();
-    fprintf(stderr, "\ntotal %d tokens, speed %.1f tok/s\n\n\n", pos - 1, (pos - 1) / (double)(end - start) * 1000);
+    fprintf(stderr, "\ntotal %d tokens, speed %.1f token/s\n\n\n", pos - 1, (pos - 1) / (double)(end - start) * 1000);
   }
   free(host_logits);
   free(prompt_tokens);
@@ -1007,14 +851,14 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 
 
 int main(int argc, char *argv[]) {
-  char *checkpoint_path = "stories15M-q8.bin";
+  char *checkpoint_path = "stories15M.bin";
   char *tokenizer_path = "tokenizer.bin";
   float temperature = 1.0f;
   float topp = 0.9f;
   int steps = 256;
   char *prompt = NULL;
   unsigned long long rng_seed = (unsigned int)time(NULL);
-  if (getenv("RUNQCUDA_SEED")) rng_seed = (unsigned long long)atoll(getenv("RUNQCUDA_SEED"));
+  if (getenv("RUNCUDA_SEED")) rng_seed = (unsigned long long)atoll(getenv("RUNCUDA_SEED"));
   if (argc >= 2) {
     checkpoint_path = argv[1];
   }

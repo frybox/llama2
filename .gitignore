@@ -3,12 +3,12 @@ zig/zig-out/
 zig/.zig-cache/
 
 # c build artifacts
-c/run
-c/runq
-c/runv
-c/runqv
-c/runcuda
-c/runqcuda
+c/llama2_cpu
+c/llama2q_cpu
+c/llama2_cpuv
+c/llama2q_cpuv
+c/llama2_cuda
+c/llama2q_cuda
 c/run.O3
 c/run.Ofast
 c/runq.ofast
