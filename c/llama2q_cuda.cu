@@ -260,7 +260,7 @@ void mmap_weights(Weights *w, Config *c, void *ptr) {
 }
 
 
-void read_checkpoint(char *path, Config *c, Weights *w, int *fd, float **data, ssize_t *fsize) {
+void read_checkpoint(const char *path, Config *c, Weights *w, int *fd, float **data, ssize_t *fsize) {
   FILE *f = fopen(path, "rb");
   if (!f) { mexit("Can't open file"); }
   uint32_t magic_number;
@@ -362,7 +362,7 @@ void upload_weights(Transformer *tr) {
 }
 
 
-void build_transformer(Transformer *tr, char *path) {
+void build_transformer(Transformer *tr, const char *path) {
   read_checkpoint(path, &tr->c, &tr->w, &tr->fd, &tr->data, &tr->fsize);
   malloc_state(tr, &tr->s, &tr->c);
   upload_weights(tr);
@@ -671,7 +671,7 @@ float *forward(Transformer *tr, int token, int pos) {
 
 
 typedef struct {
-  char *str;
+  const char *str;
   int id;
 } TokenIndex;
 
@@ -691,7 +691,7 @@ int compare_tokens(const void *a, const void *b) {
 }
 
 
-void build_tokenizer(Tokenizer *t, char *path, int vocab_size) {
+void build_tokenizer(Tokenizer *t, const char *path, int vocab_size) {
   t->vocab_size = vocab_size;
   t->vocab = (char **)malloc(vocab_size * sizeof(char*));
   t->scores = (float*)malloc(vocab_size * sizeof(float));
@@ -749,14 +749,14 @@ void safe_printf(char *piece) {
 }
 
 
-int str_lookup(char *str, TokenIndex *sorted, int vocab_size) {
+int str_lookup(const char *str, TokenIndex *sorted, int vocab_size) {
   TokenIndex tok = { .str = str };
   TokenIndex *res = (TokenIndex*)bsearch(&tok, sorted, vocab_size, sizeof(TokenIndex), compare_tokens);
   return res != NULL ? res->id : -1;
 }
 
 
-void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *ntokens) {
+void encode(Tokenizer *t, const char *text, int8_t bos, int8_t eos, int *tokens, int *ntokens) {
   if (!text) mexit("cannot encode NULL text");
   if (!t->sorted) {
     t->sorted = (TokenIndex*)malloc(t->vocab_size * sizeof(TokenIndex));
@@ -774,7 +774,7 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     int dummy_suffix = str_lookup(" ", t->sorted, t->vocab_size);
     tokens[n++] = dummy_suffix;
   }
-  for (char *c = text; *c != '\0'; c++) {
+  for (const char *c = text; *c != '\0'; c++) {
     if ((*c & 0xC0) != 0x80) strlen = 0;
     strbuf[strlen++] = *c;
     strbuf[strlen] = '\0';
@@ -958,8 +958,8 @@ long time_in_ms() {
 }
 
 
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
-  char *empty_prompt = "";
+void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, const char *prompt, int steps) {
+  const char *empty_prompt = "";
   if (!prompt) prompt = empty_prompt;
   int num_prompt_tokens = 0;
   int *prompt_tokens = (int*)malloc((strlen(prompt) + 3) * sizeof(int));
@@ -999,8 +999,8 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 
 
 int main(int argc, char *argv[]) {
-  char *checkpoint_path = "stories15M-q8.bin";
-  char *tokenizer_path = "tokenizer.bin";
+  const char *checkpoint_path = "stories15M-q8.bin";
+  const char *tokenizer_path = "tokenizer.bin";
   float temperature = 1.0f;
   float topp = 0.9f;
   int steps = 256;

@@ -183,7 +183,7 @@ void mmap_weights(Weights *w, Config *c, float *p) {
 }
 
 
-void read_checkpoint(char *path, Config *c, Weights *w, int *fd, float **data, ssize_t *fsize) {
+void read_checkpoint(const char *path, Config *c, Weights *w, int *fd, float **data, ssize_t *fsize) {
   FILE *f = fopen(path, "rb");
   if (!f) { mexit("Can't open file"); }
   if (fread(c, sizeof(*c), 1, f) != 1) { fexit(f, "Invalid file"); }
@@ -235,7 +235,7 @@ void upload_weights(Transformer *tr) {
 }
 
 
-void build_transformer(Transformer *tr, char *path) {
+void build_transformer(Transformer *tr, const char *path) {
   read_checkpoint(path, &tr->c, &tr->w, &tr->fd, &tr->data, &tr->fsize);
   malloc_state(tr, &tr->s, &tr->c);
   upload_weights(tr);
@@ -264,57 +264,30 @@ void  free_transformer(Transformer *tr) {
 }
 
 
-// *o[i] = w[i] * x[i] * ss, ss = 1/sqrt(mean(x^2)+eps); o and x may alias
-__global__ void rms_scale_kernel(float *o, const float *x, const float *w, int size, float ss) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < size) {
-    o[idx] = w[idx] * ss * x[idx];
+// o[i] = x[i] * w[i] * (1/sqrt(mean(x^2)+eps)); o and x may alias;
+// single block, whole rmsnorm on-device (no host round-trip)
+__global__ void rmsnorm_kernel(float *o, const float *x, const float *w, int size) {
+  extern __shared__ float red[];
+  float sum = 0.0f;
+  for (int i=threadIdx.x; i<size; i+=blockDim.x) {
+    sum += x[i] * x[i];
   }
-}
-
-
-// x[i] -= val
-__global__ void sub_kernel(float *x, int size, float val) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < size) {
-    x[idx] -= val;
+  red[threadIdx.x] = sum;
+  __syncthreads();
+  for (int i=blockDim.x/2; i>0; i>>=1) {
+    if (threadIdx.x < i) {
+      red[threadIdx.x] += red[threadIdx.x+i];
+    }
+    __syncthreads();
   }
-}
-
-
-// x[i] = expf(x[i])
-__global__ void exp_kernel(float *x, int size) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < size) {
-    x[idx] = expf(x[idx]);
+  if (threadIdx.x == 0) {
+    float s = 1.0 / sqrtf(red[0] / (float)size + 1e-5f);
+    red[0] = s;
   }
-}
-
-
-// x[i] /= val
-__global__ void div_kernel(float *x, int size, float val) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < size) {
-    x[idx] /= val;
-  }
-}
-
-
-void rmsnorm(float *o, float *x, float *w, int size) {
-  float hostbuf[8192];
-  float ss = 0.0f;
-  if (size > (int)(sizeof(hostbuf) / sizeof(float))) mexit("rmsnorm: size too big");
-  CUDA_CHECK(cudaMemcpy(hostbuf, x, sizeof(float) * size, cudaMemcpyDeviceToHost));
-  for (int i = 0; i < size; i++) {
-    ss += hostbuf[i] * hostbuf[i];
-  }
-  ss /= size;
-  ss += 1e-5f;
-  ss = 1.0f / sqrtf(ss);
-  {
-    int threads = 256;
-    int blocks = (size + threads - 1) / threads;
-    rms_scale_kernel<<<blocks, threads>>>(o, x, w, size, ss);
+  __syncthreads();
+  float s = red[0];
+  for (int i=threadIdx.x; i<size; i+=blockDim.x) {
+    o[i] = x[i] * w[i] * s;
   }
 }
 
@@ -342,27 +315,129 @@ __global__ void matmul_kernel(float *o, const float *w, const float *x, int n, i
 }
 
 
-// softmax in place; reductions done on the host (sizes are small here)
-void softmax(float *x, int size) {
-  float hostbuf[8192];
-  float maxv;
-  float sum;
-  if (size > (int)(sizeof(hostbuf) / sizeof(float))) mexit("softmax: size too big");
-  CUDA_CHECK(cudaMemcpy(hostbuf, x, sizeof(float) * size, cudaMemcpyDeviceToHost));
-  maxv = hostbuf[0];
-  for (int i = 1; i < size; i++) {
-    if (hostbuf[i] > maxv) maxv = hostbuf[i];
+// o[i] += sum_j w[i*n + j] * x[j]; residual epilogue fused (one block per row)
+__global__ void matmul_axpy_kernel(float *o, const float *w, const float *x, int n, int d) {
+  extern __shared__ float red[];
+  int i = blockIdx.x;
+  const float *wi = w + (size_t)i * n;
+  float v = 0.0f;
+  for (int j = threadIdx.x; j < n; j += blockDim.x) {
+    v += wi[j] * x[j];
   }
-  sum = 0.0f;
-  for (int i = 0; i < size; i++) {
-    sum += expf(hostbuf[i] - maxv);
+  red[threadIdx.x] = v;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      red[threadIdx.x] += red[threadIdx.x + s];
+    }
+    __syncthreads();
   }
-  {
-    int threads = 256;
-    int blocks = (size + threads - 1) / threads;
-    sub_kernel<<<blocks, threads>>>(x, size, maxv);
-    exp_kernel<<<blocks, threads>>>(x, size);
-    div_kernel<<<blocks, threads>>>(x, size, sum);
+  if (threadIdx.x == 0) {
+    o[i] += red[0];
+  }
+}
+
+
+// fused q/k/v projection: rows 0..dim-1 -> q, dim..dim+kvdim-1 -> k, rest -> v
+__global__ void qkv_kernel(float *q, float *k, float *v,
+                           const float *wq, const float *wk, const float *wv,
+                           const float *x, int dim, int kvdim) {
+  extern __shared__ float red[];
+  int i = blockIdx.x;
+  const float *w;
+  float *o;
+  if (i < dim) {
+    w = wq; o = q;
+  } else if (i < dim + kvdim) {
+    w = wk; o = k; i -= dim;
+  } else {
+    w = wv; o = v; i -= dim + kvdim;
+  }
+  const float *wi = w + (size_t)i * dim;
+  float acc = 0.0f;
+  for (int j = threadIdx.x; j < dim; j += blockDim.x) {
+    acc += wi[j] * x[j];
+  }
+  red[threadIdx.x] = acc;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      red[threadIdx.x] += red[threadIdx.x + s];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    o[i] = red[0];
+  }
+}
+
+
+// fused ffn gate/up projection: rows 0..ffndim-1 -> h (w1), rest -> h1 (w3)
+__global__ void ffn_gate_kernel(float *h, float *h1,
+                                const float *w1, const float *w3,
+                                const float *x, int dim, int ffndim) {
+  extern __shared__ float red[];
+  int i = blockIdx.x;
+  const float *w;
+  float *o;
+  if (i < ffndim) {
+    w = w1; o = h;
+  } else {
+    w = w3; o = h1; i -= ffndim;
+  }
+  const float *wi = w + (size_t)i * dim;
+  float acc = 0.0f;
+  for (int j = threadIdx.x; j < dim; j += blockDim.x) {
+    acc += wi[j] * x[j];
+  }
+  red[threadIdx.x] = acc;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      red[threadIdx.x] += red[threadIdx.x + s];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    o[i] = red[0];
+  }
+}
+
+
+// softmax of `rows` contiguous rows of length `size`, one block per row
+__global__ void softmax_rows_kernel(float *x, int rows, int size) {
+  extern __shared__ float red[];
+  float *xr = x + (size_t)blockIdx.x * size;
+  float m = -INFINITY;
+  for (int i = threadIdx.x; i < size; i += blockDim.x) {
+    m = fmaxf(m, xr[i]);
+  }
+  red[threadIdx.x] = m;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+    }
+    __syncthreads();
+  }
+  __syncthreads();
+  float maxv = red[0];
+  float v = 0.0f;
+  for (int i = threadIdx.x; i < size; i += blockDim.x) {
+    v += expf(xr[i] - maxv);
+  }
+  red[threadIdx.x] = v;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      red[threadIdx.x] += red[threadIdx.x + s];
+    }
+    __syncthreads();
+  }
+  __syncthreads();
+  float inv = 1.0f / red[0];
+  for (int i = threadIdx.x; i < size; i += blockDim.x) {
+    xr[i] = expf(xr[i] - maxv) * inv;
   }
 }
 
@@ -459,7 +534,6 @@ __global__ void attn_value_kernel(float *x1, const float *attn, const float *vca
 
 float *forward(Transformer *tr, int token, int pos) {
   Config *c = &tr->c;
-  Weights *w = &tr->w;
   State *s = &tr->s;
   float *x = s->x;
   int dim = c->dim;
@@ -468,6 +542,7 @@ float *forward(Transformer *tr, int token, int pos) {
   int ffndim = c->ffndim;
   int hsize = dim / c->nheads;
   int threads = 256;
+  size_t shared = threads * sizeof(float);
 
   {
     float *content = tr->w.embeddings + (size_t)token * dim;
@@ -476,47 +551,44 @@ float *forward(Transformer *tr, int token, int pos) {
 
   for (unsigned long long l = 0; l < c->nlayers; l++) {
     // 1. self-attention sublayer
-    rmsnorm(s->x1, x, tr->dev_wrmsattn + l * dim, dim);
+    rmsnorm_kernel<<<1, threads, shared>>>(s->x1, x, tr->dev_wrmsattn + l * dim, dim);
     float *k = s->kcache + l * (size_t)c->ncontext * kvdim + pos * kvdim;
     float *v = s->vcache + l * (size_t)c->ncontext * kvdim + pos * kvdim;
-    matmul_kernel<<<dim, threads, threads * sizeof(float)>>>(s->q, tr->dev_wq + l * (size_t)dim * dim, s->x1, dim, dim);
-    matmul_kernel<<<kvdim, threads, threads * sizeof(float)>>>(k, tr->dev_wk + l * (size_t)dim * kvdim, s->x1, dim, kvdim);
-    matmul_kernel<<<kvdim, threads, threads * sizeof(float)>>>(v, tr->dev_wv + l * (size_t)dim * kvdim, s->x1, dim, kvdim);
+    qkv_kernel<<<dim + 2 * kvdim, threads, shared>>>(s->q, k, v,
+        tr->dev_wq + l * (size_t)dim * dim, tr->dev_wk + l * (size_t)dim * kvdim,
+        tr->dev_wv + l * (size_t)dim * kvdim, s->x1, dim, kvdim);
     {
       dim3 blocks(dim / 2);
       rope_kernel<<<blocks, threads>>>(s->q, k, dim, kvdim, hsize, pos);
     }
     {
       dim3 blocks(c->nheads, pos + 1);
-      attn_score_kernel<<<blocks, threads, threads * sizeof(float)>>>(s->attn, s->q, s->kcache + l * (size_t)c->ncontext * kvdim, c->nheads, pos, hsize, kvdim, kvmul);
+      attn_score_kernel<<<blocks, threads, shared>>>(s->attn, s->q, s->kcache + l * (size_t)c->ncontext * kvdim, c->nheads, pos, hsize, kvdim, kvmul);
     }
-    for (int h = 0; h < c->nheads; h++) {
-      softmax(s->attn + h * (pos + 1), pos + 1);
-    }
+    softmax_rows_kernel<<<c->nheads, threads, shared>>>(s->attn, c->nheads, pos + 1);
     {
       dim3 blocks(c->nheads, hsize);
-      attn_value_kernel<<<blocks, threads, threads * sizeof(float)>>>(s->x1, s->attn, s->vcache + l * (size_t)c->ncontext * kvdim, c->nheads, pos, hsize, kvdim, kvmul);
+      attn_value_kernel<<<blocks, threads, shared>>>(s->x1, s->attn, s->vcache + l * (size_t)c->ncontext * kvdim, c->nheads, pos, hsize, kvdim, kvmul);
     }
-    matmul_kernel<<<dim, threads, threads * sizeof(float)>>>(s->x2, tr->dev_wo + l * (size_t)dim * dim, s->x1, dim, dim);
-    axpy_kernel<<<(dim + threads - 1) / threads, threads>>>(x, s->x2, dim);
+    matmul_axpy_kernel<<<dim, threads, shared>>>(x, tr->dev_wo + l * (size_t)dim * dim, s->x1, dim, dim);
 
     // 2. ffn sublayer
-    rmsnorm(s->x1, x, tr->dev_wrmsffn + l * dim, dim);
-    matmul_kernel<<<ffndim, threads, threads * sizeof(float)>>>(s->h, tr->dev_w1 + l * (size_t)dim * ffndim, s->x1, dim, ffndim);
-    matmul_kernel<<<ffndim, threads, threads * sizeof(float)>>>(s->h1, tr->dev_w3 + l * (size_t)dim * ffndim, s->x1, dim, ffndim);
+    rmsnorm_kernel<<<1, threads, shared>>>(s->x1, x, tr->dev_wrmsffn + l * dim, dim);
+    ffn_gate_kernel<<<2 * ffndim, threads, shared>>>(s->h, s->h1,
+        tr->dev_w1 + l * (size_t)dim * ffndim, tr->dev_w3 + l * (size_t)dim * ffndim,
+        s->x1, dim, ffndim);
     silu_mul_kernel<<<(ffndim + threads - 1) / threads, threads>>>(s->h, s->h1, ffndim);
-    matmul_kernel<<<dim, threads, threads * sizeof(float)>>>(s->x1, tr->dev_w2 + l * (size_t)ffndim * dim, s->h, ffndim, dim);
-    axpy_kernel<<<(dim + threads - 1) / threads, threads>>>(x, s->x1, dim);
+    matmul_axpy_kernel<<<dim, threads, shared>>>(x, tr->dev_w2 + l * (size_t)ffndim * dim, s->h, ffndim, dim);
   }
 
-  rmsnorm(x, x, tr->dev_wrmsfinal, dim);
-  matmul_kernel<<<c->nvocab, threads, threads * sizeof(float)>>>(s->logits, tr->dev_embeddings, x, dim, c->nvocab);
+  rmsnorm_kernel<<<1, threads, shared>>>(x, x, tr->dev_wrmsfinal, dim);
+  matmul_kernel<<<c->nvocab, threads, shared>>>(s->logits, tr->dev_embeddings, x, dim, c->nvocab);
   return s->logits;
 }
 
 
 typedef struct {
-  char *str;
+  const char *str;
   int id;
 } TokenIndex;
 
@@ -536,7 +608,7 @@ int compare_tokens(const void *a, const void *b) {
 }
 
 
-void build_tokenizer(Tokenizer *t, char *path, int vocab_size) {
+void build_tokenizer(Tokenizer *t, const char *path, int vocab_size) {
   t->vocab_size = vocab_size;
   t->vocab = (char **)malloc(vocab_size * sizeof(char*));
   t->scores = (float*)malloc(vocab_size * sizeof(float));
@@ -594,14 +666,14 @@ void safe_printf(char *piece) {
 }
 
 
-int str_lookup(char *str, TokenIndex *sorted, int vocab_size) {
+int str_lookup(const char *str, TokenIndex *sorted, int vocab_size) {
   TokenIndex tok = { .str = str };
   TokenIndex *res = (TokenIndex*)bsearch(&tok, sorted, vocab_size, sizeof(TokenIndex), compare_tokens);
   return res != NULL ? res->id : -1;
 }
 
 
-void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *ntokens) {
+void encode(Tokenizer *t, const char *text, int8_t bos, int8_t eos, int *tokens, int *ntokens) {
   if (!text) mexit("cannot encode NULL text");
   if (!t->sorted) {
     t->sorted = (TokenIndex*)malloc(t->vocab_size * sizeof(TokenIndex));
@@ -619,7 +691,7 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     int dummy_suffix = str_lookup(" ", t->sorted, t->vocab_size);
     tokens[n++] = dummy_suffix;
   }
-  for (char *c = text; *c != '\0'; c++) {
+  for (const char *c = text; *c != '\0'; c++) {
     if ((*c & 0xC0) != 0x80) strlen = 0;
     strbuf[strlen++] = *c;
     strbuf[strlen] = '\0';
@@ -805,8 +877,8 @@ long time_in_ms() {
 
 static int dump_done = 0;
 
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
-  char *empty_prompt = "";
+void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, const char *prompt, int steps) {
+  const char *empty_prompt = "";
   if (!prompt) prompt = empty_prompt;
   int num_prompt_tokens = 0;
   int *prompt_tokens = (int*)malloc((strlen(prompt) + 3) * sizeof(int));
@@ -851,12 +923,12 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 
 
 int main(int argc, char *argv[]) {
-  char *checkpoint_path = "stories15M.bin";
-  char *tokenizer_path = "tokenizer.bin";
+  const char *checkpoint_path = "stories15M.bin";
+  const char *tokenizer_path = "tokenizer.bin";
   float temperature = 1.0f;
   float topp = 0.9f;
   int steps = 256;
-  char *prompt = NULL;
+  const char *prompt = NULL;
   unsigned long long rng_seed = (unsigned int)time(NULL);
   if (getenv("RUNCUDA_SEED")) rng_seed = (unsigned long long)atoll(getenv("RUNCUDA_SEED"));
   if (argc >= 2) {
