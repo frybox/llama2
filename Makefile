@@ -24,6 +24,12 @@ crun: c
 	c/runq
 	c/runv
 	c/runqv
+	LLAMA2_KERNEL=scalar c/runv
+	LLAMA2_KERNEL=avx2 c/runv
+	LLAMA2_KERNEL=avx512 c/runv
+	LLAMA2_KERNEL=scalar c/runqv
+	LLAMA2_KERNEL=avx2 c/runqv
+	LLAMA2_KERNEL=avx512 c/runqv
 
 # bit-exactness / near-exactness checks for the GEMV kernels (scalar/avx2/avx512).
 # Both tests carry the kernels as copies of the ones in c/runv.c / c/runqv.c and
@@ -45,9 +51,15 @@ zdebug:
 
 zrun: z
 	zig/zig-out/bin/llama2
-	zig/zig-out/bin/llama2v
 	zig/zig-out/bin/llama2q
+	zig/zig-out/bin/llama2v
 	zig/zig-out/bin/llama2qv
+	LLAMA2_KERNEL=scalar zig/zig-out/bin/llama2v
+	LLAMA2_KERNEL=avx2 zig/zig-out/bin/llama2v
+	LLAMA2_KERNEL=avx512 zig/zig-out/bin/llama2v
+	LLAMA2_KERNEL=scalar zig/zig-out/bin/llama2qv
+	LLAMA2_KERNEL=avx2 zig/zig-out/bin/llama2qv
+	LLAMA2_KERNEL=avx512 zig/zig-out/bin/llama2qv
 
 .PHONY: clean
 clean:
@@ -58,4 +70,3 @@ clean:
 	rm -f c/test_matmul
 	rm -f c/test_fp32
 	rm -rf zig/zig-out
-

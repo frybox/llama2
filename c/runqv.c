@@ -558,13 +558,19 @@ static CpuCaps runq_cpu (void) {
   if (level > level_implemented) { level = level_implemented; kernel = "avx512"; }
 
   // manual override
-  const char *e = getenv("RUNQ_KERNEL");
+  const char *e = getenv("LLAMA2_KERNEL");
+  int forced = 0;
+  int flevel = 0;
   if (e) {
-    if      (!strcmp(e, "scalar")) { level = 0; kernel = "scalar"; }
-    else if (!strcmp(e, "avx2"))   { level = 1; kernel = "avx2";   }
-    else if (!strcmp(e, "avx512")) { level = 2; kernel = "avx512"; }
-    else if (!strcmp(e, "amx"))    { level = 3; kernel = "amx";    }
-    else fprintf(stderr, "RUNQ_KERNEL: unknown value '%s', ignoring\n", e);
+    if      (!strcmp(e, "scalar")) { flevel = 0; forced = 1; }
+    else if (!strcmp(e, "avx2"))   { flevel = 1; forced = 1;   }
+    else if (!strcmp(e, "avx512")) { flevel = 2; forced = 1; }
+    else if (!strcmp(e, "amx"))    { flevel = 3; forced = 1;    }
+    else fprintf(stderr, "LLAMA2_KERNEL: unknown value '%s', ignoring\n", e);
+  }
+  if (forced && flevel < level) {
+    level = flevel;
+    kernel = e;
   }
   caps.level = level;
   caps.kernel = kernel;

@@ -312,13 +312,14 @@ static int run_kernel_level(void) {
   static int cached = -1;
   if (cached >= 0) return cached;
   int level = 0;
-  const char *e = getenv("RUN_KERNEL");
+  int flevel = 0;
+  const char *e = getenv("LLAMA2_KERNEL");
   int forced = 0;
   if (e) {
-    if (strcmp(e, "scalar") == 0)      { level = 0; forced = 1; }
-    else if (strcmp(e, "avx2") == 0)   { level = 1; forced = 1; }
-    else if (strcmp(e, "avx512") == 0) { level = 2; forced = 1; }
-    else fprintf(stderr, "RUN_KERNEL: unknown value '%s', ignoring\n", e);
+    if (strcmp(e, "scalar") == 0)      { flevel = 0; forced = 1; }
+    else if (strcmp(e, "avx2") == 0)   { flevel = 1; forced = 1; }
+    else if (strcmp(e, "avx512") == 0) { flevel = 2; forced = 1; }
+    else fprintf(stderr, "LLAMA2_KERNEL: unknown value '%s', ignoring\n", e);
   }
   if (!forced) {
     // CPUID bits: FMA = (1).ECX[12], AVX2 = (7,0).EBX[5], AVX512F = (7,0).EBX[16].
@@ -335,7 +336,7 @@ static int run_kernel_level(void) {
     if (has_fma && has_avx2) level = 1;
     if (has_fma && has_avx2 && has_avx512f) level = 2;
   }
-  cached = level;
+  cached = forced && flevel < level ? flevel : level;
   return cached;
 }
 
