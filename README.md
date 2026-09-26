@@ -15,8 +15,8 @@ Zig 有 4 个版本：非量化 / 量化 × 标量 / SIMD。
 │   ├── llama2_cpuv.c   #   非量化 SIMD：AVX2+FMA / AVX512F intrinsics，运行时探测分派
 │   ├── llama2q_cpu.c   #   量化版本（int8 分组量化，GS=32 一组共享 scale），标量 matmul
 │   ├── llama2q_cpuv.c  #   量化 SIMD：CPUID 运行时分派 AVX2/AVX512 int8 GEMV
-│   ├── llama2_cuda.c   #   非量化 GPU（CUDA）版本
-│   ├── llama2q_cuda.c  #   量化 GPU（CUDA）版本
+│   ├── llama2_cuda.cu  #   非量化 GPU（CUDA）版本
+│   ├── llama2q_cuda.cu #   量化 GPU（CUDA）版本
 │   ├── test_matmul.c   #   int8 GEMV 内核位精确性测试（见 `make test`）
 │   └── test_fp32.c     #   fp32 GEMV 内核精度测试（见 `make test`）
 ├── zig/                # Zig 实现
@@ -42,8 +42,6 @@ Zig 侧要求 Zig `0.16.0` 及以上（见 `zig/build.zig.zon`）；CUDA 侧要�
 |------|------|
 | `make c` | 编译全部 6 个 C 版本（4 CPU + 2 CUDA），CPU `-Ofast -march=native`、CUDA `-O3 -arch=native` |
 | `make cdebug` | 编译全部 6 个 C 版本，CPU `-O3 -g`、CUDA `-O0 -g`（可移植性最好的方式） |
-| `make ccuda` | 只编译 2 个 CUDA 版本，`-O3 -arch=native` |
-| `make ccudadebug` | 只编译 2 个 CUDA 版本，`-O0 -g` |
 | `make test` | 编译并运行两个 GEMV 内核测试（`c/test_matmul.c`、`c/test_fp32.c`） |
 | `make z` | 编译全部 4 个 Zig 可执行文件，ReleaseFast |
 | `make zdebug` | 编译全部 4 个 Zig 可执行文件，Debug |
@@ -86,7 +84,7 @@ Zig 程序同理（非量化 `stories15M.bin`，量化 `stories15M-q8.bin`），
 
 ## 量化方案
 
-`llama2q_cpu.c` / `llama2q_cpuv.c` / `llama2q_cuda.c` / `llama2q_cpu.zig` / `llama2q_cpuv.zig`
+`llama2q_cpu.c` / `llama2q_cpuv.c` / `llama2q_cuda.cu` / `llama2q_cpu.zig` / `llama2q_cpuv.zig`
 使用分组 int8 量化：每 `GS=32` 个权重共享一个 fp32 scale，checkpoint 为 `stories15M-q8.bin`。
 向量内核都针对 `GS==32` 特化，其它分组大小回退 scalar。
 
@@ -108,7 +106,7 @@ Zig 程序同理（非量化 `stories15M.bin`，量化 `stories15M-q8.bin`），
   只把「每 32 元素分组的精确 int32 组和」换成 512 位
   `cvtepi8`+`madd_epi16`+`reduce_add_epi32`，float 累加结构与 `avx2`
   内核逐字相同，因此与 avx2 **位精确**；vs scalar 仍是 ~1ulp 级别差异。
-- `llama2_cuda.c` / `llama2q_cuda.c`：GEMV 在 GPU 上计算，不涉及 CPU 内核分派。
+- `llama2_cuda.cu` / `llama2q_cuda.cu`：GEMV 在 GPU 上计算，不涉及 CPU 内核分派。
 
 `llama2q_cpuv.c` 启动时打印一行能力摘要（stderr），例如：
 

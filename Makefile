@@ -7,22 +7,22 @@ CUDA = nvcc
 .PHONY: c cdebug crun ccuda ccudadebug ccrun
 
 # usually fastest for the current cpu
-c: c/llama2_cpu.c c/llama2q_cpu.c c/llama2_cpuv.c c/llama2q_cpuv.c c/llama2_cuda.c c/llama2q_cuda.c
+c: c/llama2_cpu.c c/llama2q_cpu.c c/llama2_cpuv.c c/llama2q_cpuv.c c/llama2_cuda.cu c/llama2q_cuda.cu
 	$(CC) -Ofast -march=native -o c/llama2_cpu c/llama2_cpu.c -lm
 	$(CC) -Ofast -march=native -o c/llama2q_cpu c/llama2q_cpu.c -lm
 	$(CC) -Ofast -march=native -o c/llama2_cpuv c/llama2_cpuv.c -lm
 	$(CC) -Ofast -march=native -o c/llama2q_cpuv c/llama2q_cpuv.c -lm
-	$(CUDA) -x cu -O3 -arch=native -o c/llama2_cuda c/llama2_cuda.c -lcudart -lm
-	$(CUDA) -x cu -O3 -arch=native -o c/llama2q_cuda c/llama2q_cuda.c -lcudart -lm
+	$(CUDA) -O3 -arch=native -o c/llama2_cuda c/llama2_cuda.cu -lcudart -lm
+	$(CUDA) -O3 -arch=native -o c/llama2q_cuda c/llama2q_cuda.cu -lcudart -lm
 
 # the most basic way of building that is most likely to work on most systems
-cdebug: c/llama2_cpu.c c/llama2q_cpu.c c/llama2_cpuv.c c/llama2q_cpuv.c c/llama2_cuda.c c/llama2q_cuda.c
+cdebug: c/llama2_cpu.c c/llama2q_cpu.c c/llama2_cpuv.c c/llama2q_cpuv.c c/llama2_cuda.cu c/llama2q_cuda.cu
 	$(CC) -O3 -g -o c/llama2_cpu c/llama2_cpu.c -lm
 	$(CC) -O3 -g -o c/llama2q_cpu c/llama2q_cpu.c -lm
 	$(CC) -O3 -g -o c/llama2_cpuv c/llama2_cpuv.c -lm
 	$(CC) -O3 -g -o c/llama2q_cpuv c/llama2q_cpuv.c -lm
-	$(CUDA) -x cu -O0 -g -arch=native -o c/llama2_cuda c/llama2_cuda.c -lcudart -lm
-	$(CUDA) -x cu -O0 -g -arch=native -o c/llama2q_cuda c/llama2q_cuda.c -lcudart -lm
+	$(CUDA) -O0 -g -arch=native -o c/llama2_cuda c/llama2_cuda.cu -lcudart -lm
+	$(CUDA) -O0 -g -arch=native -o c/llama2q_cuda c/llama2q_cuda.cu -lcudart -lm
 
 
 crun: c

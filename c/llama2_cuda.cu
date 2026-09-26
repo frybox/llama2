@@ -392,7 +392,7 @@ __global__ void silu_mul_kernel(float *h, const float *h1, int n) {
 __global__ void rope_kernel(float *q, float *k, int dim, int kvdim, int hsize, int pos) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i * 2 >= dim) return;
-  int hdim = i % hsize;
+  int hdim = 2 * (i % (hsize / 2));
   float freq = 1.0f / powf(10000.0f, hdim / (float)hsize);
   float val = (float)pos * freq;
   float fcr = cosf(val);

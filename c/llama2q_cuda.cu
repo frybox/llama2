@@ -339,20 +339,24 @@ void upload_weights(Transformer *tr) {
   CUDA_CHECK(cudaMemcpy(tr->dev_wrmsattn, tr->w.wrmsattn, sizeof(float) * (size_t)nlayers * dim, cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(tr->dev_wrmsffn, tr->w.wrmsffn, sizeof(float) * (size_t)nlayers * dim, cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(tr->dev_wrmsfinal, tr->w.wrmsfinal, sizeof(float) * dim, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_wq, tr->w.wq[0].q, sizeof(int8_t) * (size_t)nlayers * dim2, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_wq_s, tr->w.wq[0].s, sizeof(float) * (size_t)nlayers * dim2 / GS, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_wk, tr->w.wk[0].q, sizeof(int8_t) * (size_t)nlayers * dimkv, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_wk_s, tr->w.wk[0].s, sizeof(float) * (size_t)nlayers * dimkv / GS, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_wv, tr->w.wv[0].q, sizeof(int8_t) * (size_t)nlayers * dimkv, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_wv_s, tr->w.wv[0].s, sizeof(float) * (size_t)nlayers * dimkv / GS, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_wo, tr->w.wo[0].q, sizeof(int8_t) * (size_t)nlayers * dim2, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_wo_s, tr->w.wo[0].s, sizeof(float) * (size_t)nlayers * dim2 / GS, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_w1, tr->w.w1[0].q, sizeof(int8_t) * (size_t)nlayers * dimff, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_w1_s, tr->w.w1[0].s, sizeof(float) * (size_t)nlayers * dimff / GS, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_w2, tr->w.w2[0].q, sizeof(int8_t) * (size_t)nlayers * ffn_dim, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_w2_s, tr->w.w2[0].s, sizeof(float) * (size_t)nlayers * ffn_dim / GS, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_w3, tr->w.w3[0].q, sizeof(int8_t) * (size_t)nlayers * dimff, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(tr->dev_w3_s, tr->w.w3[0].s, sizeof(float) * (size_t)nlayers * dimff / GS, cudaMemcpyHostToDevice));
+  // Host layout from init_quantized_tensors is per-layer interleaved:
+  // [l0.q][l0.s][l1.q][l1.s]...  — copy each layer's q and s separately.
+  for (unsigned long long l = 0; l < nlayers; l++) {
+    CUDA_CHECK(cudaMemcpy(tr->dev_wq + l * dim2, tr->w.wq[l].q, sizeof(int8_t) * dim2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(tr->dev_wq_s + l * dim2 / GS, tr->w.wq[l].s, sizeof(float) * dim2 / GS, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(tr->dev_wk + l * dimkv, tr->w.wk[l].q, sizeof(int8_t) * dimkv, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(tr->dev_wk_s + l * dimkv / GS, tr->w.wk[l].s, sizeof(float) * dimkv / GS, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(tr->dev_wv + l * dimkv, tr->w.wv[l].q, sizeof(int8_t) * dimkv, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(tr->dev_wv_s + l * dimkv / GS, tr->w.wv[l].s, sizeof(float) * dimkv / GS, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(tr->dev_wo + l * dim2, tr->w.wo[l].q, sizeof(int8_t) * dim2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(tr->dev_wo_s + l * dim2 / GS, tr->w.wo[l].s, sizeof(float) * dim2 / GS, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(tr->dev_w1 + l * dimff, tr->w.w1[l].q, sizeof(int8_t) * dimff, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(tr->dev_w1_s + l * dimff / GS, tr->w.w1[l].s, sizeof(float) * dimff / GS, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(tr->dev_w2 + l * ffn_dim, tr->w.w2[l].q, sizeof(int8_t) * ffn_dim, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(tr->dev_w2_s + l * ffn_dim / GS, tr->w.w2[l].s, sizeof(float) * ffn_dim / GS, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(tr->dev_w3 + l * dimff, tr->w.w3[l].q, sizeof(int8_t) * dimff, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(tr->dev_w3_s + l * dimff / GS, tr->w.w3[l].s, sizeof(float) * dimff / GS, cudaMemcpyHostToDevice));
+  }
   CUDA_CHECK(cudaMemcpy(tr->dev_qtok, tr->w.q_tokens->q, sizeof(int8_t) * (size_t)c->nvocab * dim, cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(tr->dev_qtok_s, tr->w.q_tokens->s, sizeof(float) * (size_t)c->nvocab * dim / GS, cudaMemcpyHostToDevice));
 }
@@ -538,7 +542,7 @@ __global__ void silu_mul_kernel(float *h, const float *h1, int n) {
 __global__ void rope_kernel(float *q, float *k, int dim, int kvdim, int hsize, int pos) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i * 2 >= dim) return;
-  int hdim = i % hsize;
+  int hdim = 2 * (i % (hsize / 2));
   float freq = 1.0f / powf(10000.0f, hdim / (float)hsize);
   float val = (float)pos * freq;
   float fcr = cosf(val);
