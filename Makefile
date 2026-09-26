@@ -2,7 +2,7 @@
 # example override to clang: make run CC=clang
 CC = gcc
 
-.PHONY: c cdebug crun
+.PHONY: c cdebug crun ccuda ccudadebug ccrun
 
 # usually fastest for the current cpu
 c: c/run.c c/runq.c c/runv.c c/runqv.c
@@ -10,6 +10,20 @@ c: c/run.c c/runq.c c/runv.c c/runqv.c
 	$(CC) -Ofast -march=native -o c/runq c/runq.c -lm
 	$(CC) -Ofast -march=native -o c/runv c/runv.c -lm
 	$(CC) -Ofast -march=native -o c/runqv c/runqv.c -lm
+
+# GPU (CUDA) builds: f32 weights and i8 quantized weights
+CUDA = nvcc
+ccuda: c/runcuda.c c/runqcuda.c
+	$(CUDA) -x cu -O3 -arch=native -o c/runcuda c/runcuda.c -lcudart -lm
+	$(CUDA) -x cu -O3 -arch=native -o c/runqcuda c/runqcuda.c -lcudart -lm
+
+ccudadebug: c/runcuda.c c/runqcuda.c
+	$(CUDA) -x cu -O0 -g -arch=native -o c/runcuda c/runcuda.c -lcudart -lm
+	$(CUDA) -x cu -O0 -g -arch=native -o c/runqcuda c/runqcuda.c -lcudart -lm
+
+ccrun: ccuda
+	c/runcuda
+	c/runqcuda
 
 # the most basic way of building that is most likely to work on most systems
 cdebug: c/run.c c/runq.c c/runv.c c/runqv.c
@@ -67,6 +81,9 @@ clean:
 	rm -f c/runq
 	rm -f c/runv
 	rm -f c/runqv
+	rm -f c/runcuda
+	rm -f c/runqcuda
 	rm -f c/test_matmul
 	rm -f c/test_fp32
 	rm -rf zig/zig-out
+

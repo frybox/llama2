@@ -7,12 +7,15 @@ c/run
 c/runq
 c/runv
 c/runqv
+c/runcuda
+c/runqcuda
 c/run.O3
 c/run.Ofast
 c/runq.ofast
 c/test_matmul
 c/test_fp32
 c/*.s
+*.swp
 
 # gprof output
 gmon.out
