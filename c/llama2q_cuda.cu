@@ -529,6 +529,38 @@ __global__ void rmsnorm_quant_kernel(float *o, const float *x, const float *w, i
 }
 
 
+// fused x += y; rmsnorm(x); quantize -> o=x*w*sc, q/s (single block, dim small)
+__global__ void axpy_rmsnorm_quant_kernel(float *o, float *x, const float *y, const float *w,
+                                          int size, int8_t *q, float *s, int gs) {
+  extern __shared__ float red[];
+  for (int i = threadIdx.x; i < size; i += blockDim.x) x[i] += y[i];
+  __syncthreads();
+  float sum = 0.0f;
+  for (int i = threadIdx.x; i < size; i += blockDim.x) sum += x[i] * x[i];
+  red[threadIdx.x] = sum;
+  __syncthreads();
+  for (int i = blockDim.x / 2; i > 0; i >>= 1) {
+    if (threadIdx.x < i) red[threadIdx.x] += red[threadIdx.x + i];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) red[0] = 1.0f / sqrtf(red[0] / (float)size + 1e-5f);
+  __syncthreads();
+  float sc = red[0];
+  for (int i = threadIdx.x; i < size; i += blockDim.x) o[i] = x[i] * w[i] * sc;
+  __syncthreads();
+  int nfull = (size / gs) * gs;
+  for (int i = threadIdx.x; i < nfull; i += blockDim.x) {
+    int g = i / gs;
+    const float *pg = o + g * gs;
+    float maxv = 0.0f;
+    for (int j = 0; j < gs; j++) { float v = fabsf(pg[j]); if (v > maxv) maxv = v; }
+    float gsc = maxv / 127.0f;
+    if (i % gs == 0) s[g] = gsc;
+    q[i] = (int8_t)roundf(o[i] / gsc);
+  }
+}
+
+
 // fused silu(h)*h1 + group-quantize of the result (h in/out, h1 read, q/s out)
 __global__ void silu_mul_quant_kernel(float *h, const float *h1, int n,
                                       int8_t *q, float *s, int gs) {
@@ -623,6 +655,35 @@ __global__ void attn_rope_score_kernel(float *attn, const float *q, const float 
   if (threadIdx.x == 0) {
     attn[(size_t)h * (pos + 1) + t] = red[0] / sqrtf((float)hsize);
   }
+}
+
+
+// fused w1+w3: rows [0,ffndim)->h/w1, [ffndim,2ffndim)->h1/w3 (both dim->ffndim)
+__global__ void qmatmul_w1w3_kernel(float *h, float *h1, const int8_t *w1, const int8_t *w3,
+                                    const float *ws1, const float *ws3,
+                                    const int8_t *xq, const float *xs, int dim, int ffndim, int gs) {
+  extern __shared__ float red[];
+  int i = blockIdx.x;
+  const int8_t *wr; const float *wsc; float *o; int idx;
+  if (i < ffndim) { wr = w1; wsc = ws1; o = h; idx = i; }
+  else { idx = i - ffndim; wr = w3; wsc = ws3; o = h1; }
+  int in = idx * dim;
+  int nfull = (dim / gs) * gs;
+  float vv = 0.0f;
+  for (int j = threadIdx.x * gs; j < nfull; j += blockDim.x * gs) {
+    int32_t iv = 0;
+    for (int kk = 0; kk < gs; kk++) {
+      iv += (int32_t)wr[in + j + kk] * (int32_t)xq[j + kk];
+    }
+    vv += (float)iv * wsc[(in + j) / gs] * xs[j / gs];
+  }
+  red[threadIdx.x] = vv;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) o[idx] = red[0];
 }
 
 
@@ -777,12 +838,10 @@ float *forward(Transformer *tr, int token, int pos) {
     }
     quantize_kernel<<<(dim + threads - 1) / threads, threads>>>(tr->dev_x1, dim, tr->dev_xq_q, tr->dev_xq_s, GS);
     qmatmul_kernel<<<dim, threads, shared>>>(tr->dev_x2, tr->dev_wo + l * dim2, tr->dev_wo_s + l * dim2 / GS, tr->dev_xq_q, tr->dev_xq_s, dim, dim, GS);
-    axpy_kernel<<<(dim + threads - 1) / threads, threads>>>(x, tr->dev_x2, dim);
 
-    // 2. ffn sublayer
-    rmsnorm_quant_kernel<<<1, threads, shared>>>(tr->dev_x1, x, tr->dev_wrmsffn + l * dim, dim, tr->dev_xq_q, tr->dev_xq_s, GS);
-    qmatmul_kernel<<<ffndim, threads, shared>>>(tr->dev_h, tr->dev_w1 + l * dimff, tr->dev_w1_s + l * dimff / GS, tr->dev_xq_q, tr->dev_xq_s, dim, ffndim, GS);
-    qmatmul_kernel<<<ffndim, threads, shared>>>(tr->dev_h1, tr->dev_w3 + l * dimff, tr->dev_w3_s + l * dimff / GS, tr->dev_xq_q, tr->dev_xq_s, dim, ffndim, GS);
+    // 2. ffn sublayer: x += x2; rmsnorm(x)->x1; quantize (fused, one launch)
+    axpy_rmsnorm_quant_kernel<<<1, threads, shared>>>(tr->dev_x1, x, tr->dev_x2, tr->dev_wrmsffn + l * dim, dim, tr->dev_xq_q, tr->dev_xq_s, GS);
+    qmatmul_w1w3_kernel<<<2 * ffndim, threads, shared>>>(tr->dev_h, tr->dev_h1, tr->dev_w1 + l * dimff, tr->dev_w3 + l * dimff, tr->dev_w1_s + l * dimff / GS, tr->dev_w3_s + l * dimff / GS, tr->dev_xq_q, tr->dev_xq_s, dim, ffndim, GS);
     silu_mul_quant_kernel<<<(ffndim + threads - 1) / threads, threads>>>(tr->dev_h, tr->dev_h1, ffndim, tr->dev_hq_q, tr->dev_hq_s, GS);
     qmatmul_kernel<<<dim, threads, shared>>>(tr->dev_x1, tr->dev_w2 + l * ffn_dim, tr->dev_w2_s + l * ffn_dim / GS, tr->dev_hq_q, tr->dev_hq_s, ffndim, dim, GS);
     axpy_kernel<<<(dim + threads - 1) / threads, threads>>>(x, tr->dev_x1, dim);
