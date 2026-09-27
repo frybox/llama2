@@ -1246,9 +1246,10 @@ static int sample_device(Transformer *tr, Sampler *sampler, float *dev_logits,
   State *s = &tr->s;
   const int threads = 256;
   size_t shared = (size_t)threads * sizeof(float);
-  int blocks = (n + threads - 1) / threads;
-  sample_prep_kernel<<<blocks, threads, shared>>>(s->sample_e, s->sample_idx, s->sample_S,
-                                                   dev_logits, n, temperature);
+  // kernel is block-strided over the full n: every block computes the same result,
+  // so a handful of blocks suffices (125 redundant blocks read the whole vocab 125x)
+  sample_prep_kernel<<<16, threads, shared>>>(s->sample_e, s->sample_idx, s->sample_S,
+                                               dev_logits, n, temperature);
   thrust::sort_by_key(thrust::device_pointer_cast(s->sample_e),
                       thrust::device_pointer_cast(s->sample_e + n),
                       thrust::device_pointer_cast(s->sample_idx));
