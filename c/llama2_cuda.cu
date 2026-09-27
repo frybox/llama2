@@ -13,6 +13,11 @@
     #include <sys/mman.h>
 #endif
 #include <cuda_runtime.h>
+#include <thrust/sort.h>
+#include <thrust/device_ptr.h>
+#include <thrust/partition.h>
+#include <thrust/tuple.h>
+#include <thrust/iterator/zip_iterator.h>
 
 
 #define CUDA_CHECK(x) do { \
@@ -61,6 +66,14 @@ typedef struct {
   float *logits;
   float *kcache;
   float *vcache;
+  // device sampling workspace
+  float *sample_e;
+  int *sample_idx;
+  float *sample_S;
+  int *next_token;
+  // compact F (nucleus set) workspace: filtered + bitonic-sorted in one kernel
+  float *sample_Ke;
+  int *sample_Ki;
 } State;
 
 
@@ -94,6 +107,11 @@ typedef struct {
   float *dev_logits;
   float *dev_kcache;
   float *dev_vcache;
+  // device sampling buffers
+  float *dev_sample_e;
+  int *dev_sample_idx;
+  float *dev_sample_S;
+  int *dev_next_token;
 } Transformer;
 
 
@@ -123,6 +141,10 @@ void malloc_state(Transformer *tr, State *s, Config *c) {
   CUDA_CHECK(cudaMalloc(&s->logits, sizeof(float) * c->nvocab));
   CUDA_CHECK(cudaMalloc(&s->kcache, sizeof(float) * (size_t)c->nlayers * c->ncontext * kvdim));
   CUDA_CHECK(cudaMalloc(&s->vcache, sizeof(float) * (size_t)c->nlayers * c->ncontext * kvdim));
+  CUDA_CHECK(cudaMalloc(&s->sample_e, sizeof(float) * (size_t)c->nvocab));
+  CUDA_CHECK(cudaMalloc(&s->sample_idx, sizeof(int) * (size_t)c->nvocab));
+  CUDA_CHECK(cudaMalloc(&s->sample_S, sizeof(float) * 1));
+  CUDA_CHECK(cudaMalloc(&s->next_token, sizeof(int) * 1));
   if (!s->x || !s->x1 || !s->x2 || !s->h || !s->h1 || !s->q ||
       !s->attn || !s->logits || !s->kcache || !s->vcache) {
     mexit("cudaMalloc state failed!");
@@ -137,6 +159,10 @@ void malloc_state(Transformer *tr, State *s, Config *c) {
   tr->dev_logits = s->logits;
   tr->dev_kcache = s->kcache;
   tr->dev_vcache = s->vcache;
+  tr->dev_sample_e = s->sample_e;
+  tr->dev_sample_idx = s->sample_idx;
+  tr->dev_sample_S = s->sample_S;
+  tr->dev_next_token = s->next_token;
 }
 
 
@@ -151,6 +177,10 @@ void free_state(State *s) {
   cudaFree(s->logits);
   cudaFree(s->kcache);
   cudaFree(s->vcache);
+  cudaFree(s->sample_e);
+  cudaFree(s->sample_idx);
+  cudaFree(s->sample_S);
+  cudaFree(s->next_token);
 }
 
 
@@ -532,6 +562,20 @@ __global__ void attn_value_kernel(float *x1, const float *attn, const float *vca
 }
 
 
+// x := emb (device embedding row); x1 := emb * w * (1/sqrt(mean(emb^2)+eps)); single block
+__global__ void init_rmsnorm_kernel(float *x, float *x1, const float *emb, const float *w, int dim) {
+  extern __shared__ float red[];
+  float sum = 0.0f;
+  for (int i=threadIdx.x; i<dim; i+=blockDim.x) sum += emb[i]*emb[i];
+  red[threadIdx.x]=sum; __syncthreads();
+  for (int i=blockDim.x/2;i>0;i>>=1){ if(threadIdx.x<i) red[threadIdx.x]+=red[threadIdx.x+i]; __syncthreads(); }
+  if (threadIdx.x==0) red[0]=1.0f/sqrtf(red[0]/(float)dim+1e-5f);
+  __syncthreads();
+  float s=red[0];
+  for (int i=threadIdx.x;i<dim;i+=blockDim.x){ float e=emb[i]; x[i]=e; x1[i]=e*w[i]*s; }
+}
+
+
 float *forward(Transformer *tr, int token, int pos) {
   Config *c = &tr->c;
   State *s = &tr->s;
@@ -544,14 +588,13 @@ float *forward(Transformer *tr, int token, int pos) {
   int threads = 256;
   size_t shared = threads * sizeof(float);
 
-  {
-    float *content = tr->w.embeddings + (size_t)token * dim;
-    CUDA_CHECK(cudaMemcpy(x, content, sizeof(float) * dim, cudaMemcpyHostToDevice));
-  }
+  init_rmsnorm_kernel<<<1, threads, shared>>>(s->x, s->x1, tr->dev_embeddings + (size_t)token * dim, tr->dev_wrmsattn, dim);
 
   for (unsigned long long l = 0; l < c->nlayers; l++) {
-    // 1. self-attention sublayer
-    rmsnorm_kernel<<<1, threads, shared>>>(s->x1, x, tr->dev_wrmsattn + l * dim, dim);
+    // 1. self-attention sublayer (l==0's rmsnorm fused into init above)
+    if (l > 0) {
+      rmsnorm_kernel<<<1, threads, shared>>>(s->x1, x, tr->dev_wrmsattn + l * dim, dim);
+    }
     float *k = s->kcache + l * (size_t)c->ncontext * kvdim + pos * kvdim;
     float *v = s->vcache + l * (size_t)c->ncontext * kvdim + pos * kvdim;
     qkv_kernel<<<dim + 2 * kvdim, threads, shared>>>(s->q, k, v,
@@ -868,6 +911,151 @@ int sample(Sampler *sampler, float *logits) {
 }
 
 
+// device top-p sampling: prep (softmax e + S), thrust sort, pick. Returns chosen token.
+// distributionally equivalent to host sample_topp (e and p differ by common factor 1/S).
+__global__ void sample_prep_kernel(float *e, int *idx, float *out_S, const float *logits, int n, float temperature);
+__global__ void sample_pick_kernel(int *next, const float *e, const int *idx, int n, float topp, float coin, const float *out_S);
+static int sample_device(Transformer *tr, Sampler *sampler, float *dev_logits,
+                         float temperature, float topp, float coin) {
+  int n = tr->c.nvocab;
+  State *s = &tr->s;
+  const int threads = 256;
+  size_t shared = (size_t)threads * sizeof(float);
+  int blocks = (n + threads - 1) / threads;
+  sample_prep_kernel<<<blocks, threads, shared>>>(s->sample_e, s->sample_idx, s->sample_S,
+                                                   dev_logits, n, temperature);
+  thrust::sort_by_key(thrust::device_pointer_cast(s->sample_e),
+                      thrust::device_pointer_cast(s->sample_e + n),
+                      thrust::device_pointer_cast(s->sample_idx));
+  sample_pick_kernel<<<1, 1>>>(s->next_token, s->sample_e, s->sample_idx, n, topp, coin, s->sample_S);
+  int tok;
+  CUDA_CHECK(cudaMemcpy(&tok, s->next_token, sizeof(int), cudaMemcpyDeviceToHost));
+  return tok;
+}
+
+
+// device softmax prep: e[i]=expf((l[i]/temp) - max_scaled), S=sum e (block tree), max via block tree
+// grid-stride: e[i]=expf(l[i]/temp - max), idx[i]=i, *out_S=sum(e); max & sum via block tree
+__global__ void sample_prep_kernel(float *e, int *idx, float *out_S, const float *logits, int n, float temperature) {
+  extern __shared__ float red[];
+  float maxv = -INFINITY;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    float l = logits[i] / temperature;
+    if (l > maxv) maxv = l;
+  }
+  red[threadIdx.x] = maxv;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+    __syncthreads();
+  }
+  float m = red[0];
+  float sum = 0.0f;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    float ev = expf(logits[i] / temperature - m);
+    e[i] = ev;
+    idx[i] = i;
+    sum += ev;
+  }
+  red[threadIdx.x] = sum;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) *out_S = red[0];
+}
+
+
+// single thread: nucleus top-p over e[] ascending (sorted), idx[] token ids.
+// F = {i: e[i] >= cutoff_e}, cutoff_e=(1-topp)/(n-1)*S. Walk from top (n-1 down).
+// mathematically equivalent to host sample_topp: e and p differ by common factor 1/S,
+// which cancels in every comparison and in the coin crossing.
+__global__ void sample_pick_kernel(int *next, const float *e, const int *idx, int n,
+                                   float topp, float coin, const float *out_S) {
+  if (threadIdx.x == 0) {
+    float S = *out_S;
+    float cutoff_e = (1.0f - topp) / (n - 1) * S;
+    float slast = 0.0f;
+    for (int i = n - 1; i >= 0; i--) {
+      if (e[i] < cutoff_e) break;
+      slast += e[i];
+      if (slast > topp * S) break;
+    }
+    float r = coin * slast;
+    float cum = 0.0f;
+    int token = 0;
+    for (int i = n - 1; i >= 0; i--) {
+      if (e[i] < cutoff_e) break;
+      cum += e[i];
+      token = idx[i];
+      if (r < cum) break;
+    }
+    *next = token;
+  }
+}
+
+
+// Fused compact sampler: ONE block filters F={e>=cutoff_e} into shared, bitonic-sorts
+// ascending, walks top-p pick. Replaces the whole thrust sort (60us CUB device-wide
+// overhead, ~5-10 launches) with a single launch. Bit-exact vs host sample_topp:
+// e=p*S (S=sum e), so every e-unit comparison equals the p-unit one; distinct probs give
+// a unique ascending order, so bitonic and qsort agree; coin crossing identical.
+// If |F|>KMAX the result is flagged and caller falls back to the thrust path.
+__global__ void sample_pick_compact_kernel(int *next, const float *e, const int *idx, int n,
+                                           float topp, float coin, const float *out_S,
+                                           int *out_overflow) {
+  extern __shared__ float red[]; // layout: [512 se][512 si-as-float][1 sk]
+  const int KMAX = 512;
+  float *se = red;
+  int *si = (int *)(red + 512);
+  int *sk = (int *)(red + 1024);
+  if (threadIdx.x == 0) {
+    for (int j = 0; j < KMAX; j++) se[j] = -INFINITY;
+    *sk = 0;
+  }
+  __syncthreads();
+  float S = *out_S;
+  float cutoff_e = (1.0f - topp) / (n - 1) * S;
+  // parallel filter into shared (strided over n); atomic slot, capped at KMAX
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    if (e[i] >= cutoff_e) {
+      int p = atomicAdd(sk, 1);
+      if (p < KMAX) { se[p] = e[i]; si[p] = idx[i]; }
+    }
+  }
+  __syncthreads();
+  int k = *sk;
+  if (k > KMAX) k = KMAX;
+  if (threadIdx.x == 0) *out_overflow = (k > KMAX);
+  // bitonic sort ascending over KMAX (padded), verified formula, 1 thread per pair
+  for (int len = 2; len <= KMAX; len <<= 1) {
+    for (int kk = len >> 1; kk > 0; kk >>= 1) {
+      for (int p = threadIdx.x; p < KMAX / 2; p += blockDim.x) {
+        int base = (p / kk) * (2 * kk);
+        int j = p % kk;
+        int x = base + j, y = base + j + kk;
+        int dir = (p / kk) & 1;
+        if (dir) { if (se[x] < se[y]) { float t=se[x];se[x]=se[y];se[y]=t; int tv=si[x];si[x]=si[y];si[y]=tv; } }
+        else     { if (se[x] > se[y]) { float t=se[x];se[x]=se[y];se[y]=t; int tv=si[x];si[x]=si[y];si[y]=tv; } }
+      }
+      __syncthreads();
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    int lo = KMAX - k, hi = KMAX; // real values occupy top k slots after ascending sort
+    float slast = 0.0f;
+    for (int i = hi - 1; i >= lo; i--) { slast += se[i]; if (slast > topp * S) break; }
+    float r = coin * slast;
+    float cum = 0.0f;
+    int token = si[hi-1];
+    for (int i = hi-1; i >= lo; i--) { cum += se[i]; token = si[i]; if (r < cum) break; }
+    *next = token;
+  }
+}
+
+
 long time_in_ms() {
   struct timespec time;
   clock_gettime(CLOCK_REALTIME, &time);
@@ -893,16 +1081,17 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
   int pos = 0;
   while (pos < steps) {
     float *logits = forward(transformer, token, pos);
-    CUDA_CHECK(cudaMemcpy(host_logits, logits, sizeof(float) * transformer->c.nvocab, cudaMemcpyDeviceToHost));
     if (pos == 0 && getenv("CUDADUMP") && !dump_done) {
       dump_done = 1;
+      CUDA_CHECK(cudaMemcpy(host_logits, logits, sizeof(float) * transformer->c.nvocab, cudaMemcpyDeviceToHost));
       for (int i = 0; i < 12; i++) fprintf(stderr, "CUDALOGIT %.6f ", host_logits[i]);
       fprintf(stderr, "\n");
     }
     if (pos < num_prompt_tokens - 1) {
       next = prompt_tokens[pos + 1];
     } else {
-      next = sample(sampler, host_logits);
+      float coin = random_f32(&sampler->rng_state);
+      next = sample_device(transformer, sampler, logits, sampler->temperature, sampler->topp, coin);
     }
     pos++;
     if (next == 1) break;
