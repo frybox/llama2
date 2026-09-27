@@ -498,6 +498,134 @@ __global__ void softmax_rows_kernel(float *x, int rows, int size) {
 
 
 
+// fused rmsnorm + group-quantize: o[i]=x[i]*w[i]*sc (sc=1/sqrt(mean(x^2)+eps));
+// then q[i]=round(o[i]/gsc_g), gsc_g=max|o in group g|/127. 1 block, o/x may alias.
+__global__ void rmsnorm_quant_kernel(float *o, const float *x, const float *w, int size,
+                                     int8_t *q, float *s, int gs) {
+  extern __shared__ float red[];
+  float sum = 0.0f;
+  for (int i = threadIdx.x; i < size; i += blockDim.x) sum += x[i] * x[i];
+  red[threadIdx.x] = sum;
+  __syncthreads();
+  for (int i = blockDim.x / 2; i > 0; i >>= 1) {
+    if (threadIdx.x < i) red[threadIdx.x] += red[threadIdx.x + i];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) red[0] = 1.0f / sqrtf(red[0] / (float)size + 1e-5f);
+  __syncthreads();
+  float sc = red[0];
+  for (int i = threadIdx.x; i < size; i += blockDim.x) o[i] = x[i] * w[i] * sc;
+  __syncthreads();
+  int nfull = (size / gs) * gs;
+  for (int i = threadIdx.x; i < nfull; i += blockDim.x) {
+    int g = i / gs;
+    const float *pg = o + g * gs;
+    float maxv = 0.0f;
+    for (int j = 0; j < gs; j++) { float v = fabsf(pg[j]); if (v > maxv) maxv = v; }
+    float gsc = maxv / 127.0f;
+    if (i % gs == 0) s[g] = gsc;
+    q[i] = (int8_t)roundf(o[i] / gsc);
+  }
+}
+
+
+// fused silu(h)*h1 + group-quantize of the result (h in/out, h1 read, q/s out)
+__global__ void silu_mul_quant_kernel(float *h, const float *h1, int n,
+                                      int8_t *q, float *s, int gs) {
+  int nfull = (n / gs) * gs;
+  for (int i = threadIdx.x; i < nfull; i += blockDim.x) {
+    float val = h[i];
+    h[i] = val * (1.0f / (1.0f + expf(-val))) * h1[i];
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < nfull; i += blockDim.x) {
+    int g = i / gs;
+    const float *pg = h + g * gs;
+    float maxv = 0.0f;
+    for (int j = 0; j < gs; j++) { float v = fabsf(pg[j]); if (v > maxv) maxv = v; }
+    float gsc = maxv / 127.0f;
+    if (i % gs == 0) s[g] = gsc;
+    q[i] = (int8_t)roundf(h[i] / gsc);
+  }
+}
+
+
+// fused QKV: rows [0,dim)->q/wq, [dim,2dim)->k/wk, [2dim,3dim)->v/wv (kvdim==dim)
+__global__ void qmatmul_qkv_kernel(float *q, float *k, float *v,
+                                   const int8_t *wq, const int8_t *wk, const int8_t *wv,
+                                   const float *wsq, const float *wks, const float *wsv,
+                                   const int8_t *xq, const float *xs, int dim, int gs) {
+  extern __shared__ float red[];
+  int i = blockIdx.x;
+  const int8_t *wr; const float *wsc; float *o; int idx;
+  if (i < dim) { wr = wq; wsc = wsq; o = q; idx = i; }
+  else if (i < 2 * dim) { int j = i - dim; wr = wk; wsc = wks; o = k; idx = j; }
+  else { int j = i - 2 * dim; wr = wv; wsc = wsv; o = v; idx = j; }
+  int in = idx * dim;
+  int nfull = (dim / gs) * gs;
+  float vv = 0.0f;
+  for (int j = threadIdx.x * gs; j < nfull; j += blockDim.x * gs) {
+    int32_t iv = 0;
+    for (int kk = 0; kk < gs; kk++) {
+      iv += (int32_t)wr[in + j + kk] * (int32_t)xq[j + kk];
+    }
+    vv += (float)iv * wsc[(in + j) / gs] * xs[j / gs];
+  }
+  red[threadIdx.x] = vv;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) o[idx] = red[0];
+}
+
+
+// rope on per-block q/k slices then q.k dot (fuses rope + attn_score);
+// each block rotates its own copy of the head's q and k slices, so the
+// (unrotated) kcache stays consistent across blocks
+__global__ void attn_rope_score_kernel(float *attn, const float *q, const float *kcache,
+                                       int nheads, int pos, int hsize, int kvdim, int kvmul) {
+  extern __shared__ float red[]; // [0,hsize) q slice, [hsize,2hsize) k slice, then reduction
+  int h = blockIdx.x;
+  int t = blockIdx.y;
+  const float *qsrc = q + h * hsize;
+  const float *ksrc = kcache + (size_t)t * kvdim + (h / kvmul) * hsize;
+  for (int i = threadIdx.x; i < hsize; i += blockDim.x) {
+    red[i] = qsrc[i];
+    red[hsize + i] = ksrc[i];
+  }
+  __syncthreads();
+  for (int p = threadIdx.x; p < hsize / 2; p += blockDim.x) {
+    int i = 2 * p;
+    float freq = 1.0f / powf(10000.0f, (float)i / (float)hsize);
+    float crq = cosf((float)pos * freq), ciq = sinf((float)pos * freq);
+    float crk = cosf((float)t * freq), cik = sinf((float)t * freq);
+    float v0 = red[i], v1 = red[i + 1];
+    red[i] = v0 * crq - v1 * ciq;
+    red[i + 1] = v0 * ciq + v1 * crq;
+    v0 = red[hsize + i]; v1 = red[hsize + i + 1];
+    red[hsize + i] = v0 * crk - v1 * cik;
+    red[hsize + i + 1] = v0 * cik + v1 * crk;
+  }
+  __syncthreads();
+  float v = 0.0f;
+  for (int i = threadIdx.x; i < hsize; i += blockDim.x) {
+    v += red[i] * red[hsize + i];
+  }
+  __syncthreads(); // q/k slices no longer needed before reduction overwrites red[]
+  red[threadIdx.x] = v;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    attn[(size_t)h * (pos + 1) + t] = red[0] / sqrtf((float)hsize);
+  }
+}
+
+
 // out[i] = sum_g (sum_k wq[in+j+k]*xq[j+k]) * ws[(in+j)/GS] * xs[j/GS]
 // one block per output row; n and d must be divisible by GS
 __global__ void qmatmul_kernel(float *o, const int8_t *wq, const float *ws,
@@ -634,20 +762,13 @@ float *forward(Transformer *tr, int token, int pos) {
 
   for (unsigned long long l = 0; l < c->nlayers; l++) {
     // 1. self-attention sublayer
-    rmsnorm_kernel<<<1, threads, shared>>>(tr->dev_x1, x, tr->dev_wrmsattn + l * dim, dim);
+    rmsnorm_quant_kernel<<<1, threads, shared>>>(tr->dev_x1, x, tr->dev_wrmsattn + l * dim, dim, tr->dev_xq_q, tr->dev_xq_s, GS);
     float *k = tr->dev_kcache + l * (size_t)c->ncontext * kvdim + pos * kvdim;
     float *v = tr->dev_vcache + l * (size_t)c->ncontext * kvdim + pos * kvdim;
-    quantize_kernel<<<(dim + threads - 1) / threads, threads>>>(tr->dev_x1, dim, tr->dev_xq_q, tr->dev_xq_s, GS);
-    qmatmul_kernel<<<dim, threads, shared>>>(tr->dev_q, tr->dev_wq + l * dim2, tr->dev_wq_s + l * dim2 / GS, tr->dev_xq_q, tr->dev_xq_s, dim, dim, GS);
-    qmatmul_kernel<<<kvdim, threads, shared>>>(k, tr->dev_wk + l * dimkv, tr->dev_wk_s + l * dimkv / GS, tr->dev_xq_q, tr->dev_xq_s, dim, kvdim, GS);
-    qmatmul_kernel<<<kvdim, threads, shared>>>(v, tr->dev_wv + l * dimkv, tr->dev_wv_s + l * dimkv / GS, tr->dev_xq_q, tr->dev_xq_s, dim, kvdim, GS);
-    {
-      dim3 blocks(dim / 2);
-      rope_kernel<<<blocks, threads>>>(tr->dev_q, k, dim, kvdim, hsize, pos);
-    }
+    qmatmul_qkv_kernel<<<3 * dim, threads, shared>>>(tr->dev_q, k, v, tr->dev_wq + l * dim2, tr->dev_wk + l * dimkv, tr->dev_wv + l * dimkv, tr->dev_wq_s + l * dim2 / GS, tr->dev_wk_s + l * dimkv / GS, tr->dev_wv_s + l * dimkv / GS, tr->dev_xq_q, tr->dev_xq_s, dim, GS);
     {
       dim3 blocks(c->nheads, pos + 1);
-      attn_score_kernel<<<blocks, threads, shared>>>(tr->dev_attn, tr->dev_q, tr->dev_kcache + l * (size_t)c->ncontext * kvdim, c->nheads, pos, hsize, kvdim, kvmul);
+      attn_rope_score_kernel<<<blocks, threads, shared + 2 * hsize * sizeof(float)>>>(tr->dev_attn, tr->dev_q, tr->dev_kcache + l * (size_t)c->ncontext * kvdim, c->nheads, pos, hsize, kvdim, kvmul);
     }
     softmax_rows_kernel<<<c->nheads, threads, shared>>>(tr->dev_attn, c->nheads, pos + 1);
     {
@@ -659,18 +780,15 @@ float *forward(Transformer *tr, int token, int pos) {
     axpy_kernel<<<(dim + threads - 1) / threads, threads>>>(x, tr->dev_x2, dim);
 
     // 2. ffn sublayer
-    rmsnorm_kernel<<<1, threads, shared>>>(tr->dev_x1, x, tr->dev_wrmsffn + l * dim, dim);
-    quantize_kernel<<<(dim + threads - 1) / threads, threads>>>(tr->dev_x1, dim, tr->dev_xq_q, tr->dev_xq_s, GS);
+    rmsnorm_quant_kernel<<<1, threads, shared>>>(tr->dev_x1, x, tr->dev_wrmsffn + l * dim, dim, tr->dev_xq_q, tr->dev_xq_s, GS);
     qmatmul_kernel<<<ffndim, threads, shared>>>(tr->dev_h, tr->dev_w1 + l * dimff, tr->dev_w1_s + l * dimff / GS, tr->dev_xq_q, tr->dev_xq_s, dim, ffndim, GS);
     qmatmul_kernel<<<ffndim, threads, shared>>>(tr->dev_h1, tr->dev_w3 + l * dimff, tr->dev_w3_s + l * dimff / GS, tr->dev_xq_q, tr->dev_xq_s, dim, ffndim, GS);
-    silu_mul_kernel<<<(ffndim + threads - 1) / threads, threads>>>(tr->dev_h, tr->dev_h1, ffndim);
-    quantize_kernel<<<(ffndim + threads - 1) / threads, threads>>>(tr->dev_h, ffndim, tr->dev_hq_q, tr->dev_hq_s, GS);
+    silu_mul_quant_kernel<<<(ffndim + threads - 1) / threads, threads>>>(tr->dev_h, tr->dev_h1, ffndim, tr->dev_hq_q, tr->dev_hq_s, GS);
     qmatmul_kernel<<<dim, threads, shared>>>(tr->dev_x1, tr->dev_w2 + l * ffn_dim, tr->dev_w2_s + l * ffn_dim / GS, tr->dev_hq_q, tr->dev_hq_s, ffndim, dim, GS);
     axpy_kernel<<<(dim + threads - 1) / threads, threads>>>(x, tr->dev_x1, dim);
   }
 
-  rmsnorm_kernel<<<1, threads, shared>>>(x, x, tr->dev_wrmsfinal, dim);
-  quantize_kernel<<<(dim + threads - 1) / threads, threads>>>(x, dim, tr->dev_xq_q, tr->dev_xq_s, GS);
+  rmsnorm_quant_kernel<<<1, threads, shared>>>(x, x, tr->dev_wrmsfinal, dim, tr->dev_xq_q, tr->dev_xq_s, GS);
   qmatmul_kernel<<<c->nvocab, threads, shared>>>(tr->dev_logits, tr->dev_qtok, tr->dev_qtok_s, tr->dev_xq_q, tr->dev_xq_s, dim, c->nvocab, GS);
   return tr->dev_logits;
 }
