@@ -109,6 +109,8 @@ typedef struct {
   float *dev_sample_S;
   int *dev_next_token;
   int *dev_fcount;
+  int *dev_gparams;  // [0]=token, [1]=pos, updated per token (pinned H2D)
+  int *gparams_h;    // pinned host staging for dev_gparams
   // device weights
   float *dev_embeddings;
   float *dev_wrmsattn;
@@ -130,6 +132,10 @@ typedef struct {
   float *dev_w3_s;
   int8_t *dev_qtok;
   float *dev_qtok_s;
+  // cuda graph: whole forward captured once, replayed per token
+  cudaGraphExec_t graphExec;
+  cudaGraph_t graph;
+  cudaStream_t stream;
 } Transformer;
 
 
@@ -168,6 +174,8 @@ void malloc_state(Transformer *tr, State *s, Config *c) {
   CUDA_CHECK(cudaMalloc(&s->sample_S, sizeof(float) * 1));
   CUDA_CHECK(cudaMalloc(&s->next_token, sizeof(int) * 1));
   CUDA_CHECK(cudaMalloc(&s->fcount, sizeof(int) * 1));
+  CUDA_CHECK(cudaMalloc(&tr->dev_gparams, sizeof(int) * 2));
+  CUDA_CHECK(cudaMallocHost(&tr->gparams_h, sizeof(int) * 2));
   if (!s->x || !s->x1 || !s->x2 || !s->h || !s->h1 || !s->q ||
       !s->attn || !s->logits || !s->kcache || !s->vcache) {
     mexit("cudaMalloc state failed!");
@@ -210,6 +218,8 @@ void free_state(Transformer *tr, State *s) {
   cudaFree(s->sample_S);
   cudaFree(s->next_token);
   cudaFree(s->fcount);
+  cudaFree(tr->dev_gparams);
+  if (tr->gparams_h) cudaFreeHost(tr->gparams_h);
 }
 
 
@@ -227,6 +237,14 @@ __global__ void quantize_kernel(const float *x, int n, int8_t *q, float *s, int 
   float sc = maxv / 127.0f;
   if (i % gs == 0) s[g] = sc; // first element of each group writes its scale (exactly once)
   q[i] = (int8_t)roundf(x[i] / sc);
+}
+
+
+// x[i] = embeddings[token * dim + i]; token read from *gp so graph launches stay fixed
+__global__ void load_emb_kernel(float *x, const float *embeddings, int dim, const int *gp) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= dim) return;
+  x[i] = embeddings[(size_t)gp[0] * dim + i];
 }
 
 
@@ -414,6 +432,9 @@ void free_transformer(Transformer *tr) {
   free(tr->w.w1);
   free(tr->w.w2);
   free(tr->w.w3);
+  if (tr->graphExec) cudaGraphExecDestroy(tr->graphExec);
+  if (tr->graph) cudaGraphDestroy(tr->graph);
+  if (tr->stream) cudaStreamDestroy(tr->stream);
   if (tr->data != MAP_FAILED) {
     munmap(tr->data, tr->fsize);
   }
@@ -461,11 +482,14 @@ __global__ void rmsnorm_kernel(float *o, const float *x, const float *w, int siz
 
 
 // softmax in place, device-side; one block per row (row = attention head)
-__global__ void softmax_rows_kernel(float *x, int rows, int size) {
+// graph-ready: grid = nheads (1D, fixed), row stride = ncontext (fixed),
+// row length = pos+1 read from *gp (variable)
+__global__ void softmax_rows_kernel(float *x, const int *gp, int ncontext) {
   extern __shared__ float red[];
-  float *xr = x + (size_t)blockIdx.x * size;
+  float *xr = x + (size_t)blockIdx.x * ncontext;
+  int n = gp[1] + 1;
   float m = -INFINITY;
-  for (int i = threadIdx.x; i < size; i += blockDim.x) {
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
     m = fmaxf(m, xr[i]);
   }
   red[threadIdx.x] = m;
@@ -479,7 +503,7 @@ __global__ void softmax_rows_kernel(float *x, int rows, int size) {
   __syncthreads();
   float maxv = red[0];
   float v = 0.0f;
-  for (int i = threadIdx.x; i < size; i += blockDim.x) {
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
     v += expf(xr[i] - maxv);
   }
   red[threadIdx.x] = v;
@@ -490,7 +514,7 @@ __global__ void softmax_rows_kernel(float *x, int rows, int size) {
   }
   __syncthreads();
   float inv = 1.0f / red[0];
-  for (int i = threadIdx.x; i < size; i += blockDim.x) {
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
     xr[i] = expf(xr[i] - maxv) * inv;
   }
 }
@@ -583,16 +607,19 @@ __global__ void silu_mul_quant_kernel(float *h, const float *h1, int n,
 
 
 // fused QKV: rows [0,dim)->q/wq, [dim,2dim)->k/wk, [2dim,3dim)->v/wv (kvdim==dim)
+// k/v write offset uses pos read from *gp (device), so the graph can bake fixed
+// kbase/vbase pointers; q writes to a fixed buffer
 __global__ void qmatmul_qkv_kernel(float *q, float *k, float *v,
                                    const int8_t *wq, const int8_t *wk, const int8_t *wv,
                                    const float *wsq, const float *wks, const float *wsv,
-                                   const int8_t *xq, const float *xs, int dim, int gs) {
+                                   const int8_t *xq, const float *xs,
+                                   int dim, int kvdim, const int *gp, int gs) {
   extern __shared__ float red[];
   int i = blockIdx.x;
   const int8_t *wr; const float *wsc; float *o; int idx;
   if (i < dim) { wr = wq; wsc = wsq; o = q; idx = i; }
-  else if (i < 2 * dim) { int j = i - dim; wr = wk; wsc = wks; o = k; idx = j; }
-  else { int j = i - 2 * dim; wr = wv; wsc = wsv; o = v; idx = j; }
+  else if (i < 2 * dim) { int j = i - dim; wr = wk; wsc = wks; o = k + (size_t)gp[1] * kvdim; idx = j; }
+  else { int j = i - 2 * dim; wr = wv; wsc = wsv; o = v + (size_t)gp[1] * kvdim; idx = j; }
   int in = idx * dim;
   int nfull = (dim / gs) * gs;
   float vv = 0.0f;
@@ -615,12 +642,17 @@ __global__ void qmatmul_qkv_kernel(float *q, float *k, float *v,
 
 // rope on per-block q/k slices then q.k dot (fuses rope + attn_score);
 // each block rotates its own copy of the head's q and k slices, so the
-// (unrotated) kcache stays consistent across blocks
+// (unrotated) kcache stays consistent across blocks.
+// graph-ready: pos read from *gp, fixed grid (nheads, ncontext), blocks with
+// t > pos return immediately; attn rows use ncontext stride
 __global__ void attn_rope_score_kernel(float *attn, const float *q, const float *kcache,
-                                       int nheads, int pos, int hsize, int kvdim, int kvmul) {
+                                       const int *gp, int nheads, int ncontext,
+                                       int hsize, int kvdim, int kvmul) {
   extern __shared__ float red[]; // [0,hsize) q slice, [hsize,2hsize) k slice, then reduction
   int h = blockIdx.x;
   int t = blockIdx.y;
+  int pos = gp[1];
+  if (t > pos) return;
   const float *qsrc = q + h * hsize;
   const float *ksrc = kcache + (size_t)t * kvdim + (h / kvmul) * hsize;
   for (int i = threadIdx.x; i < hsize; i += blockDim.x) {
@@ -653,7 +685,7 @@ __global__ void attn_rope_score_kernel(float *attn, const float *q, const float 
     __syncthreads();
   }
   if (threadIdx.x == 0) {
-    attn[(size_t)h * (pos + 1) + t] = red[0] / sqrtf((float)hsize);
+    attn[(size_t)h * ncontext + t] = red[0] / sqrtf((float)hsize);
   }
 }
 
@@ -778,11 +810,14 @@ __global__ void attn_score_kernel(float *attn, const float *q, const float *kcac
 }
 
 
-__global__ void attn_value_kernel(float *x1, const float *attn, const float *vcache, int nheads, int pos, int hsize, int kvdim, int kvmul) {
+__global__ void attn_value_kernel(float *x1, const float *attn, const float *vcache,
+                                  const int *gp, int nheads, int ncontext,
+                                  int hsize, int kvdim, int kvmul) {
   extern __shared__ float red[];
   int h = blockIdx.x;
   int i = blockIdx.y;
-  const float *ah = attn + (size_t)h * (pos + 1);
+  int pos = gp[1];
+  const float *ah = attn + (size_t)h * ncontext;
   float v = 0.0f;
   for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
     v += ah[t] * vcache[(size_t)t * kvdim + (h / kvmul) * hsize + i];
@@ -801,7 +836,7 @@ __global__ void attn_value_kernel(float *x1, const float *attn, const float *vca
 }
 
 
-float *forward(Transformer *tr, int token, int pos) {
+float *forward(Transformer *tr, cudaStream_t stream) {
   Config *c = &tr->c;
   float *x = tr->dev_x;
   int dim = c->dim;
@@ -815,41 +850,44 @@ float *forward(Transformer *tr, int token, int pos) {
   size_t dimkv = (size_t)dim * kvdim;
   size_t dimff = (size_t)dim * ffndim;
   size_t ffn_dim = (size_t)ffndim * dim;
+  const int *gp = tr->dev_gparams; // [0]=token, [1]=pos, set per token on device
 
-  {
-    float *content = tr->dev_embeddings + (size_t)token * dim;
-    CUDA_CHECK(cudaMemcpy(x, content, sizeof(float) * dim, cudaMemcpyDeviceToDevice));
-  }
+  // token->embedding read from *gp so the launch (and any baked graph) stays fixed
+  load_emb_kernel<<<(dim + threads - 1) / threads, threads, 0, stream>>>(x, tr->dev_embeddings, dim, gp);
 
   for (unsigned long long l = 0; l < c->nlayers; l++) {
     // 1. self-attention sublayer
-    rmsnorm_quant_kernel<<<1, threads, shared>>>(tr->dev_x1, x, tr->dev_wrmsattn + l * dim, dim, tr->dev_xq_q, tr->dev_xq_s, GS);
-    float *k = tr->dev_kcache + l * (size_t)c->ncontext * kvdim + pos * kvdim;
-    float *v = tr->dev_vcache + l * (size_t)c->ncontext * kvdim + pos * kvdim;
-    qmatmul_qkv_kernel<<<3 * dim, threads, shared>>>(tr->dev_q, k, v, tr->dev_wq + l * dim2, tr->dev_wk + l * dimkv, tr->dev_wv + l * dimkv, tr->dev_wq_s + l * dim2 / GS, tr->dev_wk_s + l * dimkv / GS, tr->dev_wv_s + l * dimkv / GS, tr->dev_xq_q, tr->dev_xq_s, dim, GS);
-    {
-      dim3 blocks(c->nheads, pos + 1);
-      attn_rope_score_kernel<<<blocks, threads, shared + 2 * hsize * sizeof(float)>>>(tr->dev_attn, tr->dev_q, tr->dev_kcache + l * (size_t)c->ncontext * kvdim, c->nheads, pos, hsize, kvdim, kvmul);
-    }
-    softmax_rows_kernel<<<c->nheads, threads, shared>>>(tr->dev_attn, c->nheads, pos + 1);
-    {
-      dim3 blocks(c->nheads, hsize);
-      attn_value_kernel<<<blocks, threads, shared>>>(tr->dev_x1, tr->dev_attn, tr->dev_vcache + l * (size_t)c->ncontext * kvdim, c->nheads, pos, hsize, kvdim, kvmul);
-    }
-    quantize_kernel<<<(dim + threads - 1) / threads, threads>>>(tr->dev_x1, dim, tr->dev_xq_q, tr->dev_xq_s, GS);
-    qmatmul_kernel<<<dim, threads, shared>>>(tr->dev_x2, tr->dev_wo + l * dim2, tr->dev_wo_s + l * dim2 / GS, tr->dev_xq_q, tr->dev_xq_s, dim, dim, GS);
+    rmsnorm_quant_kernel<<<1, threads, shared, stream>>>(tr->dev_x1, x, tr->dev_wrmsattn + l * dim, dim, tr->dev_xq_q, tr->dev_xq_s, GS);
+    qmatmul_qkv_kernel<<<3 * dim, threads, shared, stream>>>(tr->dev_q, tr->dev_kcache + l * (size_t)c->ncontext * kvdim, tr->dev_vcache + l * (size_t)c->ncontext * kvdim, tr->dev_wq + l * dim2, tr->dev_wk + l * dimkv, tr->dev_wv + l * dimkv, tr->dev_wq_s + l * dim2 / GS, tr->dev_wk_s + l * dimkv / GS, tr->dev_wv_s + l * dimkv / GS, tr->dev_xq_q, tr->dev_xq_s, dim, kvdim, gp, GS);
+    attn_rope_score_kernel<<<dim3(c->nheads, c->ncontext), threads, shared + 2 * hsize * sizeof(float), stream>>>(tr->dev_attn, tr->dev_q, tr->dev_kcache + l * (size_t)c->ncontext * kvdim, gp, c->nheads, c->ncontext, hsize, kvdim, kvmul);
+    softmax_rows_kernel<<<c->nheads, threads, shared, stream>>>(tr->dev_attn, gp, c->ncontext);
+    attn_value_kernel<<<dim3(c->nheads, hsize), threads, shared, stream>>>(tr->dev_x1, tr->dev_attn, tr->dev_vcache + l * (size_t)c->ncontext * kvdim, gp, c->nheads, c->ncontext, hsize, kvdim, kvmul);
+    quantize_kernel<<<(dim + threads - 1) / threads, threads, 0, stream>>>(tr->dev_x1, dim, tr->dev_xq_q, tr->dev_xq_s, GS);
+    qmatmul_kernel<<<dim, threads, shared, stream>>>(tr->dev_x2, tr->dev_wo + l * dim2, tr->dev_wo_s + l * dim2 / GS, tr->dev_xq_q, tr->dev_xq_s, dim, dim, GS);
 
     // 2. ffn sublayer: x += x2; rmsnorm(x)->x1; quantize (fused, one launch)
-    axpy_rmsnorm_quant_kernel<<<1, threads, shared>>>(tr->dev_x1, x, tr->dev_x2, tr->dev_wrmsffn + l * dim, dim, tr->dev_xq_q, tr->dev_xq_s, GS);
-    qmatmul_w1w3_kernel<<<2 * ffndim, threads, shared>>>(tr->dev_h, tr->dev_h1, tr->dev_w1 + l * dimff, tr->dev_w3 + l * dimff, tr->dev_w1_s + l * dimff / GS, tr->dev_w3_s + l * dimff / GS, tr->dev_xq_q, tr->dev_xq_s, dim, ffndim, GS);
-    silu_mul_quant_kernel<<<(ffndim + threads - 1) / threads, threads>>>(tr->dev_h, tr->dev_h1, ffndim, tr->dev_hq_q, tr->dev_hq_s, GS);
-    qmatmul_kernel<<<dim, threads, shared>>>(tr->dev_x1, tr->dev_w2 + l * ffn_dim, tr->dev_w2_s + l * ffn_dim / GS, tr->dev_hq_q, tr->dev_hq_s, ffndim, dim, GS);
-    axpy_kernel<<<(dim + threads - 1) / threads, threads>>>(x, tr->dev_x1, dim);
+    axpy_rmsnorm_quant_kernel<<<1, threads, shared, stream>>>(tr->dev_x1, x, tr->dev_x2, tr->dev_wrmsffn + l * dim, dim, tr->dev_xq_q, tr->dev_xq_s, GS);
+    qmatmul_w1w3_kernel<<<2 * ffndim, threads, shared, stream>>>(tr->dev_h, tr->dev_h1, tr->dev_w1 + l * dimff, tr->dev_w3 + l * dimff, tr->dev_w1_s + l * dimff / GS, tr->dev_w3_s + l * dimff / GS, tr->dev_xq_q, tr->dev_xq_s, dim, ffndim, GS);
+    silu_mul_quant_kernel<<<(ffndim + threads - 1) / threads, threads, 0, stream>>>(tr->dev_h, tr->dev_h1, ffndim, tr->dev_hq_q, tr->dev_hq_s, GS);
+    qmatmul_kernel<<<dim, threads, shared, stream>>>(tr->dev_x1, tr->dev_w2 + l * ffn_dim, tr->dev_w2_s + l * ffn_dim / GS, tr->dev_hq_q, tr->dev_hq_s, ffndim, dim, GS);
+    axpy_kernel<<<(dim + threads - 1) / threads, threads, 0, stream>>>(x, tr->dev_x1, dim);
   }
 
-  rmsnorm_quant_kernel<<<1, threads, shared>>>(x, x, tr->dev_wrmsfinal, dim, tr->dev_xq_q, tr->dev_xq_s, GS);
-  qmatmul_kernel<<<c->nvocab, threads, shared>>>(tr->dev_logits, tr->dev_qtok, tr->dev_qtok_s, tr->dev_xq_q, tr->dev_xq_s, dim, c->nvocab, GS);
+  rmsnorm_quant_kernel<<<1, threads, shared, stream>>>(x, x, tr->dev_wrmsfinal, dim, tr->dev_xq_q, tr->dev_xq_s, GS);
+  qmatmul_kernel<<<c->nvocab, threads, shared, stream>>>(tr->dev_logits, tr->dev_qtok, tr->dev_qtok_s, tr->dev_xq_q, tr->dev_xq_s, dim, c->nvocab, GS);
   return tr->dev_logits;
+}
+
+
+// capture the whole forward (fixed grids, pos/token via dev_gparams) into one graph
+static void build_graph(Transformer *tr) {
+  CUDA_CHECK(cudaStreamCreate(&tr->stream));
+  CUDA_CHECK(cudaStreamBeginCapture(tr->stream, cudaStreamCaptureModeThreadLocal));
+  CUDA_CHECK(cudaMemcpyAsync(tr->dev_gparams, tr->gparams_h, sizeof(int) * 2, cudaMemcpyHostToDevice, tr->stream));
+  forward(tr, tr->stream);
+  CUDA_CHECK(cudaStreamEndCapture(tr->stream, &tr->graph));
+  CUDA_CHECK(cudaGraphInstantiate(&tr->graphExec, tr->graph, 0));
+  fprintf(stderr, "[graph] forward captured as single graph\n");
 }
 
 
@@ -1246,16 +1284,17 @@ static int sample_device(Transformer *tr, Sampler *sampler, float *dev_logits,
   State *s = &tr->s;
   const int threads = 256;
   size_t shared = (size_t)threads * sizeof(float);
-  // kernel is block-strided over the full n: every block computes the same result,
-  // so a handful of blocks suffices (125 redundant blocks read the whole vocab 125x)
-  sample_prep_kernel<<<16, threads, shared>>>(s->sample_e, s->sample_idx, s->sample_S,
-                                               dev_logits, n, temperature);
+  // kernel is block-strided over the full n within one block, so a single block
+  // computes the global max/sum; launch exactly one block (16 was 16x redundant).
+  sample_prep_kernel<<<1, threads, shared, tr->stream>>>(s->sample_e, s->sample_idx, s->sample_S,
+                                                 dev_logits, n, temperature);
   thrust::sort_by_key(thrust::device_pointer_cast(s->sample_e),
                       thrust::device_pointer_cast(s->sample_e + n),
                       thrust::device_pointer_cast(s->sample_idx));
-  sample_pick_kernel<<<1, 256, 256 * sizeof(float)>>>(s->next_token, s->sample_e, s->sample_idx, n, topp, coin, s->sample_S);
+  sample_pick_kernel<<<1, 256, 256 * sizeof(float), tr->stream>>>(s->next_token, s->sample_e, s->sample_idx, n, topp, coin, s->sample_S);
   int tok;
-  CUDA_CHECK(cudaMemcpy(&tok, s->next_token, sizeof(int), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpyAsync(&tok, s->next_token, sizeof(int), cudaMemcpyDeviceToHost, tr->stream));
+  CUDA_CHECK(cudaStreamSynchronize(tr->stream));
   return tok;
 }
 
@@ -1273,8 +1312,14 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
   int next;
   int token = prompt_tokens[0];
   int pos = 0;
+  build_graph(transformer); // capture forward once; per token we just replay it
   while (pos < steps) {
-    float *logits = forward(transformer, token, pos);
+    // per-token CPU: stage {token,pos} in pinned mem + one graph launch.
+    // the in-graph H2D memcpy node picks up the staged values on replay.
+    transformer->gparams_h[0] = token;
+    transformer->gparams_h[1] = pos;
+    CUDA_CHECK(cudaGraphLaunch(transformer->graphExec, transformer->stream));
+    float *logits = transformer->dev_logits;
     if (pos < num_prompt_tokens - 1) {
       next = prompt_tokens[pos + 1];
     } else {
