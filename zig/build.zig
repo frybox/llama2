@@ -97,4 +97,53 @@ pub fn build(b: *std.Build) void {
     }
     const run_qv_step = b.step("runqv", "Run the SIMD-quantized app (mainqv.zig)");
     run_qv_step.dependOn(&run_qv_cmd.step);
+
+    // llama2_cuda = GPU (CUDA) port: the 14 __global__ kernels + 12 launcher
+    // functions live in src/llama2_cuda.cu, the host (config/weights/state/
+    // forward/sampling/main) in src/llama2_cuda.zig.
+    //
+    // The .cu must be compiled by nvcc (zig cc 0.16 cannot consume a .cu), and
+    // the final link must also be done by nvcc: zig's bundled lld cannot
+    // resolve the CUB/thrust device-kernel host symbols that nvcc emits
+    // (undefined `cub::...radix_sort...` references), while nvcc-as-linker
+    // resolves them (mirroring how c/llama2_cuda is built: `nvcc ... -lcudart -lm`).
+    // So this target is a chain of Run steps rather than a single addExecutable.
+    //
+    //   (1) zig cc -c src/llama2_cuda.zig -o <host.o>
+    //   (2) nvcc -O3 -arch=native -o=<exe> <host.o> src/llama2_cuda.cu -lcudart -lm
+    //
+    // The .cu and .zig are kept in lockstep: the .cu exposes 12 flat
+    // `extern "C"` launchers (all params are device addresses / a stream) and
+    // the .zig declares matching `extern "C"` fns and drives forward() through
+    // them, exactly like the host code in c/llama2_cuda.cu.
+    const llama2_cuda_host = b.addSystemCommand(&.{
+        "zig", "cc", "-c", "src/llama2_cuda.zig",
+    });
+    const llama2_cuda_host_o = llama2_cuda_host.addPrefixedOutputFileArg("-o", "llama2_cuda_host.o");
+
+    const llama2_cuda_link = b.addSystemCommand(&.{
+        "nvcc", "-O3", "-arch=native",
+    });
+    // host.o is an input to the link (a file arg, so it re-runs when it changes).
+    llama2_cuda_link.addPrefixedFileArg("", llama2_cuda_host_o);
+    llama2_cuda_link.addFileArg(b.path("src/llama2_cuda.cu"));
+    llama2_cuda_link.addArg("-lcudart");
+    llama2_cuda_link.addArg("-lm");
+    // nvcc needs the "-o=<path>" (equals) form; zig cc needs "-o<path>".
+    const llama2_cuda_exe = llama2_cuda_link.addPrefixedOutputFileArg("-o=", "llama2_cuda");
+
+    // Install into zig-out/bin/ (addInstallBinFile auto-depends on the
+    // generated exe, so `zig build` builds it before installing).
+    const llama2_cuda_install = b.addInstallBinFile(llama2_cuda_exe, "llama2_cuda");
+    b.getInstallStep().dependOn(&llama2_cuda_install.step);
+
+    // Run the CUDA app. The model/tokenizer files are opened relative to the
+    // process cwd (std.Io.Dir.cwd()), and they live at the repo root, i.e.
+    // one level above this build root (zig/), so set cwd to the repo root.
+    const run_cuda_cmd = std.Build.Step.Run.create(b, "run llama2_cuda");
+    run_cuda_cmd.addFileArg(llama2_cuda_exe); // argv[0] = the generated exe
+    run_cuda_cmd.step.dependOn(&llama2_cuda_install.step);
+    run_cuda_cmd.setCwd(b.path("../"));
+    const run_cuda_step = b.step("runcuda", "Run the CUDA app (llama2_cuda)");
+    run_cuda_step.dependOn(&run_cuda_cmd.step);
 }
