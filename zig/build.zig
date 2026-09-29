@@ -146,4 +146,32 @@ pub fn build(b: *std.Build) void {
     run_cuda_cmd.setCwd(b.path("../"));
     const run_cuda_step = b.step("runcuda", "Run the CUDA app (llama2_cuda)");
     run_cuda_step.dependOn(&run_cuda_cmd.step);
+
+    // llama2q_cuda = Q8-quantized CUDA port: the 19 __global__ kernels +
+    // launchers live in src/llama2q_cuda.cu, the host (config/weights/state/
+    // forward/sampling/main) in src/llama2q_cuda.zig. Same two-step chain as
+    // llama2_cuda above (nvcc must do the compile and the link).
+    const llama2q_cuda_host = b.addSystemCommand(&.{
+        "zig", "cc", "-c", "src/llama2q_cuda.zig",
+    });
+    const llama2q_cuda_host_o = llama2q_cuda_host.addPrefixedOutputFileArg("-o", "llama2q_cuda_host.o");
+
+    const llama2q_cuda_link = b.addSystemCommand(&.{
+        "nvcc", "-O3", "-arch=native",
+    });
+    llama2q_cuda_link.addPrefixedFileArg("", llama2q_cuda_host_o);
+    llama2q_cuda_link.addFileArg(b.path("src/llama2q_cuda.cu"));
+    llama2q_cuda_link.addArg("-lcudart");
+    llama2q_cuda_link.addArg("-lm");
+    const llama2q_cuda_exe = llama2q_cuda_link.addPrefixedOutputFileArg("-o=", "llama2q_cuda");
+
+    const llama2q_cuda_install = b.addInstallBinFile(llama2q_cuda_exe, "llama2q_cuda");
+    b.getInstallStep().dependOn(&llama2q_cuda_install.step);
+
+    const run_qcuda_cmd = std.Build.Step.Run.create(b, "run llama2q_cuda");
+    run_qcuda_cmd.addFileArg(llama2q_cuda_exe);
+    run_qcuda_cmd.step.dependOn(&llama2q_cuda_install.step);
+    run_qcuda_cmd.setCwd(b.path("../"));
+    const run_qcuda_step = b.step("runcudaq", "Run the Q8 CUDA app (llama2q_cuda)");
+    run_qcuda_step.dependOn(&run_qcuda_cmd.step);
 }
