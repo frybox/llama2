@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <math.h>
 #include <string.h>
@@ -1066,6 +1067,33 @@ long time_in_ms() {
 }
 
 
+// LOGITS_DUMP (env, opt-in): dir to dump full per-step logits as <pos:04d>.bin
+// (nvocab little-endian f32) plus tokens.txt ("pos next" per line). No-op if unset.
+static const char *ldir = NULL;
+static FILE *ltok = NULL;
+static float *ldbuf = NULL;
+static int ldn = 0;
+static void ld_init(const char *dir, int n) {
+  ldir = dir; ldn = n;
+  mkdir(dir, 0777); // ignore error (EEXIST ok); fopen below is the real gate
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/tokens.txt", dir);
+  ltok = fopen(path, "w");
+}
+static void ld_step(int pos, const float *dev_logits, int next) {
+  if (!ltok) return;
+  if (!ldbuf) ldbuf = (float*)malloc(sizeof(float) * ldn);
+  CUDA_CHECK(cudaMemcpy(ldbuf, dev_logits, sizeof(float) * ldn, cudaMemcpyDeviceToHost));
+  char path[1024], name[64];
+  snprintf(name, sizeof(name), "%04d.bin", pos);
+  snprintf(path, sizeof(path), "%s/%s", ldir, name);
+  FILE *f = fopen(path, "wb");
+  if (f) { fwrite(ldbuf, sizeof(float) * ldn, 1, f); fclose(f); }
+  fprintf(ltok, "%d %d\n", pos, next);
+  fflush(ltok);
+}
+
+
 static int dump_done = 0;
 
 void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, const char *prompt, int steps) {
@@ -1078,6 +1106,8 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     mexit("something is wrong, expected at least 1 prompt token");
   }
   float *host_logits = (float*)malloc(sizeof(float) * transformer->c.nvocab);
+  const char *ldump_dir = getenv("LOGITS_DUMP");
+  if (ldump_dir) ld_init(ldump_dir, transformer->c.nvocab);
   long start = 0;
   int next;
   int token = prompt_tokens[0];
@@ -1096,6 +1126,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
       float coin = random_f32(&sampler->rng_state);
       next = sample_device(transformer, sampler, logits, sampler->temperature, sampler->topp, coin);
     }
+    ld_step(pos, logits, next); // env-gated dump; logits are not modified by sampling
     pos++;
     if (next == 1) break;
     char *piece = decode(tokenizer, token, next);

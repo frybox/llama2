@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <math.h>
 #include <string.h>
@@ -1179,6 +1180,34 @@ long time_in_ms() {
 }
 
 
+// LOGITS_DUMP (env, opt-in): dir to dump full per-step logits as <pos:04d>.bin
+// (nvocab little-endian f32) plus tokens.txt ("pos next" per line). No-op if unset.
+static const char *ldir = NULL;
+static FILE *ltok = NULL;
+static float *ldbuf = NULL;
+static int ldn = 0;
+static void ld_init(const char *dir, int n) {
+  ldir = dir; ldn = n;
+  mkdir(dir, 0777); // ignore error (EEXIST ok); fopen below is the real gate
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/tokens.txt", dir);
+  ltok = fopen(path, "w");
+}
+static void ld_step(int pos, const float *dev_logits, int next) {
+  if (!ltok) return;
+  if (!ldbuf) ldbuf = (float*)malloc(sizeof(float) * ldn);
+  // graph logits buffer is reused each step: must sync-copy every step.
+  CUDA_CHECK(cudaMemcpy(ldbuf, dev_logits, sizeof(float) * ldn, cudaMemcpyDeviceToHost));
+  char path[1024], name[64];
+  snprintf(name, sizeof(name), "%04d.bin", pos);
+  snprintf(path, sizeof(path), "%s/%s", ldir, name);
+  FILE *f = fopen(path, "wb");
+  if (f) { fwrite(ldbuf, sizeof(float) * ldn, 1, f); fclose(f); }
+  fprintf(ltok, "%d %d\n", pos, next);
+  fflush(ltok);
+}
+
+
 // device top-p sampling: prep (softmax e + S), sort, pick. Returns chosen token.
 // distributionally equivalent to host sample_topp (e and p differ by common factor 1/S).
 __global__ void sample_prep_kernel(float *e, int *idx, float *out_S, const float *logits, int n, float inv_temp) {
@@ -1312,6 +1341,8 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
   if (num_prompt_tokens < 1) {
     mexit("something is wrong, expected at least 1 prompt token");
   }
+  const char *ldump_dir = getenv("LOGITS_DUMP");
+  if (ldump_dir) ld_init(ldump_dir, transformer->c.nvocab);
   long start = 0;
   int next;
   int token = prompt_tokens[0];
@@ -1330,6 +1361,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
       float coin = random_f32(&sampler->rng_state);
       next = sample_device(transformer, sampler, logits, sampler->temperature, sampler->topp, coin);
     }
+    ld_step(pos, logits, next); // env-gated dump; buffer is reused, so sync-copy each step
     pos++;
     if (next == 1) break;
     char *piece = decode(tokenizer, token, next);
