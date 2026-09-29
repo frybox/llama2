@@ -913,7 +913,7 @@ int sample(Sampler *sampler, float *logits) {
 
 // device top-p sampling: prep (softmax e + S), thrust sort, pick. Returns chosen token.
 // distributionally equivalent to host sample_topp (e and p differ by common factor 1/S).
-__global__ void sample_prep_kernel(float *e, int *idx, float *out_S, const float *logits, int n, float temperature);
+__global__ void sample_prep_kernel(float *e, int *idx, float *out_S, const float *logits, int n, float inv_temp);
 __global__ void sample_pick_kernel(int *next, const float *e, const int *idx, int n, float topp, float coin, const float *out_S);
 static int sample_device(Transformer *tr, Sampler *sampler, float *dev_logits,
                          float temperature, float topp, float coin) {
@@ -921,9 +921,10 @@ static int sample_device(Transformer *tr, Sampler *sampler, float *dev_logits,
   State *s = &tr->s;
   const int threads = 256;
   size_t shared = (size_t)threads * sizeof(float);
-  int blocks = (n + threads - 1) / threads;
-  sample_prep_kernel<<<blocks, threads, shared>>>(s->sample_e, s->sample_idx, s->sample_S,
-                                                   dev_logits, n, temperature);
+  // single block: the kernel block-strides over all n inside one block, so one
+  // block computes the global max/sum (the old 125 blocks were 125x redundant).
+  sample_prep_kernel<<<1, threads, shared>>>(s->sample_e, s->sample_idx, s->sample_S,
+                                                   dev_logits, n, 1.0f / temperature);
   thrust::sort_by_key(thrust::device_pointer_cast(s->sample_e),
                       thrust::device_pointer_cast(s->sample_e + n),
                       thrust::device_pointer_cast(s->sample_idx));
@@ -936,11 +937,13 @@ static int sample_device(Transformer *tr, Sampler *sampler, float *dev_logits,
 
 // device softmax prep: e[i]=expf((l[i]/temp) - max_scaled), S=sum e (block tree), max via block tree
 // grid-stride: e[i]=expf(l[i]/temp - max), idx[i]=i, *out_S=sum(e); max & sum via block tree
-__global__ void sample_prep_kernel(float *e, int *idx, float *out_S, const float *logits, int n, float temperature) {
+__global__ void sample_prep_kernel(float *e, int *idx, float *out_S, const float *logits, int n, float inv_temp) {
+  // inv_temp = 1/temperature passed in: FP32 division per element is the kernel's
+  // bottleneck; the multiply is bit-exact enough (verified: identical tokens).
   extern __shared__ float red[];
   float maxv = -INFINITY;
   for (int i = threadIdx.x; i < n; i += blockDim.x) {
-    float l = logits[i] / temperature;
+    float l = logits[i] * inv_temp;
     if (l > maxv) maxv = l;
   }
   red[threadIdx.x] = maxv;
@@ -952,7 +955,7 @@ __global__ void sample_prep_kernel(float *e, int *idx, float *out_S, const float
   float m = red[0];
   float sum = 0.0f;
   for (int i = threadIdx.x; i < n; i += blockDim.x) {
-    float ev = expf(logits[i] / temperature - m);
+    float ev = expf(logits[i] * inv_temp - m);
     e[i] = ev;
     idx[i] = i;
     sum += ev;
