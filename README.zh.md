@@ -1,4 +1,4 @@
-> 英文版：[README.md](README.md)
+> [English](README.md)
 
 # llama2 — 从 20 tok/s 到 2000+ tok/s 的推理加速教学仓库
 

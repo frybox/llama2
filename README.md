@@ -1,4 +1,4 @@
-> 中文版：[README.zh.md](README.zh.md)
+> [中文版](README.zh.md)
 
 # llama2 — an inference-acceleration teaching repo: from 20 tok/s to 2000+ tok/s
 
