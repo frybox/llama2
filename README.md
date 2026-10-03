@@ -148,8 +148,8 @@ Zig 侧的实现方式（与 C 路线一一对应）：
 | `make cfast` | 编译 4 个 C CPU 版本（`-Ofast -march=native`），当前 CPU 通常最快 | 否 |
 | `make ccuda` | 只编译 2 个 C **CUDA** 版本（`-O3 -arch=native`） | **是** |
 | `make test` | 编译并运行两个 GEMV 内核测试（`c/test_matmul.c`、`c/test_fp32.c`），CPU 支持才跑对应内核 | 否 |
-| `make z` | 编译全部 6 个 Zig 可执行文件（4 CPU + 2 CUDA），ReleaseFast | **是** |
-| `make zdebug` | 编译全部 6 个 Zig 可执行文件，Debug | **是** |
+| `make z` | 编译全部 6 个 Zig 可执行文件（4 CPU + 2 CUDA），Debug（最基础，最慢） | **是** |
+| `make zfast` | 编译全部 6 个 Zig 可执行文件，ReleaseFast（当前 CPU 通常最快） | **是** |
 | `make clean` | 清理 C 与 Zig 的编译产物 | 否 |
 
 > 无 GPU 服务器上：`make cfast && make crun && make test` 即可走完整个 CPU 加速旅程
@@ -175,7 +175,7 @@ make c
 |------|------|:-------:|
 | `make crun` | 先 `make cfast`，跑 4 个 C **CPU** 程序（两个 SIMD 版各按 scalar/avx2/avx512 三档内核再跑一遍） | 否 |
 | `make crunall` | 先 `make cfast ccuda`，跑全部 6 个 C 程序（= `crun` + 2 个 CUDA 版） | **是** |
-| `make zrun` | 先 `make z`，跑全部 6 个 Zig 程序（= 4 CPU + 2 CUDA，两个 SIMD 版各按 scalar/avx2/avx512 再跑一遍） | **是** |
+| `make zrun` | 先 `make zfast`，跑全部 6 个 Zig 程序（= 4 CPU + 2 CUDA，两个 SIMD 版各按 scalar/avx2/avx512 再跑一遍） | **是** |
 
 或直接执行产物：
 

@@ -62,14 +62,15 @@ test: c/test_matmul.c c/test_fp32.c
 	./c/test_matmul
 	./c/test_fp32
 
-.PHONY: z zdebug zrun
+.PHONY: z zfast zrun
 z: 
-	cd zig && zig build -Doptimize=ReleaseFast
-
-zdebug: 
 	cd zig && zig build
 
-zrun: z
+# ReleaseFast, usually fastest for the current cpu (mirrors cfast above)
+zfast: 
+	cd zig && zig build -Doptimize=ReleaseFast
+
+zrun: zfast
 	zig/zig-out/bin/llama2_cpu
 	zig/zig-out/bin/llama2q_cpu
 	zig/zig-out/bin/llama2_cpuv
