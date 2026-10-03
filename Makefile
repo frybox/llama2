@@ -4,28 +4,40 @@ CC = gcc
 
 CUDA = nvcc
 
-.PHONY: c cdebug crun ccuda ccudadebug ccrun
-
-# usually fastest for the current cpu
-c: c/llama2_cpu.c c/llama2q_cpu.c c/llama2_cpuv.c c/llama2q_cpuv.c c/llama2_cuda.cu c/llama2q_cuda.cu
-	$(CC) -Ofast -march=native -o c/llama2_cpu c/llama2_cpu.c -lm
-	$(CC) -Ofast -march=native -o c/llama2q_cpu c/llama2q_cpu.c -lm
-	$(CC) -Ofast -march=native -o c/llama2_cpuv c/llama2_cpuv.c -lm
-	$(CC) -Ofast -march=native -o c/llama2q_cpuv c/llama2q_cpuv.c -lm
-	$(CUDA) -O3 -arch=native -o c/llama2_cuda c/llama2_cuda.cu -lcudart -lm
-	$(CUDA) -O3 -arch=native -o c/llama2q_cuda c/llama2q_cuda.cu -lcudart -lm
+.PHONY: c cfast ccuda crun crunall
 
 # the most basic way of building that is most likely to work on most systems
-cdebug: c/llama2_cpu.c c/llama2q_cpu.c c/llama2_cpuv.c c/llama2q_cpuv.c c/llama2_cuda.cu c/llama2q_cuda.cu
+# (also the ~20 tok/s pure-scalar baseline: no -march=native, no auto-vector)
+c: c/llama2_cpu.c c/llama2q_cpu.c c/llama2_cpuv.c c/llama2q_cpuv.c
 	$(CC) -O0 -g -o c/llama2_cpu c/llama2_cpu.c -lm
 	$(CC) -O0 -g -o c/llama2q_cpu c/llama2q_cpu.c -lm
 	$(CC) -O0 -g -o c/llama2_cpuv c/llama2_cpuv.c -lm
 	$(CC) -O0 -g -o c/llama2q_cpuv c/llama2q_cpuv.c -lm
-	$(CUDA) -O0 -g -arch=native -o c/llama2_cuda c/llama2_cuda.cu -lcudart -lm
-	$(CUDA) -O0 -g -arch=native -o c/llama2q_cuda c/llama2q_cuda.cu -lcudart -lm
 
+# usually fastest for the current cpu
+cfast: c/llama2_cpu.c c/llama2q_cpu.c c/llama2_cpuv.c c/llama2q_cpuv.c c/llama2_cuda.cu c/llama2q_cuda.cu
+	$(CC) -Ofast -march=native -o c/llama2_cpu c/llama2_cpu.c -lm
+	$(CC) -Ofast -march=native -o c/llama2q_cpu c/llama2q_cpu.c -lm
+	$(CC) -Ofast -march=native -o c/llama2_cpuv c/llama2_cpuv.c -lm
+	$(CC) -Ofast -march=native -o c/llama2q_cpuv c/llama2q_cpuv.c -lm
 
-crun: c
+ccuda: c/llama2_cuda.cu c/llama2q_cuda.cu
+	$(CUDA) -O3 -arch=native -o c/llama2_cuda c/llama2_cuda.cu -lcudart -lm
+	$(CUDA) -O3 -arch=native -o c/llama2q_cuda c/llama2q_cuda.cu -lcudart -lm
+
+crun: cfast
+	c/llama2_cpu
+	c/llama2q_cpu
+	c/llama2_cpuv
+	c/llama2q_cpuv
+	LLAMA2_KERNEL=scalar c/llama2_cpuv
+	LLAMA2_KERNEL=avx2   c/llama2_cpuv
+	LLAMA2_KERNEL=avx512 c/llama2_cpuv
+	LLAMA2_KERNEL=scalar c/llama2q_cpuv
+	LLAMA2_KERNEL=avx2   c/llama2q_cpuv
+	LLAMA2_KERNEL=avx512 c/llama2q_cpuv
+
+crunall: cfast ccuda
 	c/llama2_cpu
 	c/llama2q_cpu
 	c/llama2_cpuv
@@ -68,6 +80,8 @@ zrun: z
 	LLAMA2_KERNEL=scalar zig/zig-out/bin/llama2q_cpuv
 	LLAMA2_KERNEL=avx2   zig/zig-out/bin/llama2q_cpuv
 	LLAMA2_KERNEL=avx512 zig/zig-out/bin/llama2q_cpuv
+	zig/zig-out/bin/llama2_cuda
+	zig/zig-out/bin/llama2q_cuda
 
 .PHONY: clean
 clean:

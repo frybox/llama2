@@ -45,8 +45,8 @@
 
 1. **0 → 1（~20 → ~200–250）**：只把编译参数从「最保守的标量」换成
    `-Ofast -march=native`。现代编译器会把标量 matmul 自动向量化、展开，
-   同一份源码白拿 ~10×。这也是本仓库 `make c` 的默认编译方式。
-   （要亲眼看到 20 tok/s 的基线，用 `-O0` 单独编译 `llama2_cpu.c`，见下文构建。）
+   同一份源码白拿 ~10×。`make c` 用 `-O0` 编（~20 tok/s 基线），
+   `make cfast` 用 `-Ofast -march=native` 编——两者源码相同，只差编译参数。
 
 2. **1 → 2（~250 → ~250，显式 SIMD 与自动向量化打平）**：对内存带宽受限的小模型，
    「显式 SIMD fp32」相对「编译器自动向量化」收益有限——两者都在吃同一条 DRAM 带宽屋顶。
@@ -136,23 +136,31 @@ Zig 侧的实现方式（与 C 路线一一对应）：
 
 ## 四、构建
 
-- C 侧：`gcc`/`clang`（`make CC=clang` 可换），CUDA 版另需 `nvcc`。
-- Zig 侧：Zig `0.16.0+`（见 `zig/build.zig.zon`），CUDA 版另需 `nvcc`。
+- C 侧：`gcc`/`clang`（`make CC=clang` 可换）。**CUDA 版另需 `nvcc`**（仅 `ccuda`/`crunall` 用到）。
+- Zig 侧：Zig `0.16.0+`（见 `zig/build.zig.zon`）。**CUDA 版另需 `nvcc`**（`make z` 会构建全部 6 个，含 2 个 CUDA）。
 
-| 命令 | 说明 |
-|------|------|
-| `make c` | 编译全部 6 个 C 版本（4 CPU + 2 CUDA），CPU `-Ofast -march=native`、CUDA `-O3 -arch=native` |
-| `make cdebug` | 编译全部 6 个 C 版本，CPU `-O0 -g`、CUDA `-O0 -g`（可移植性最好；`-O0` 即「纯标量 ~20 tok/s」基线） |
-| `make test` | 编译并运行两个 GEMV 内核测试（`c/test_matmul.c`、`c/test_fp32.c`），CPU 支持才跑对应内核 |
-| `make z` | 编译全部 6 个 Zig 可执行文件，ReleaseFast |
-| `make zdebug` | 编译全部 6 个 Zig 可执行文件，Debug |
-| `make clean` | 清理 C 与 Zig 的编译产物 |
+构建按「需要 GPU 工具链」拆成两组，**没有 NVIDIA 显卡的 x86_64 服务器**（只有 gcc/clang，无 nvcc）
+也能走完整条 C 路线（4 个 CPU 版本 + 测试 + 跑通），只需跳过带 `cuda` 的目标：
 
-**复现「~20 tok/s 纯标量基线」**（`make c` 默认是 `-Ofast` 会自动向量化，看不到 20）：
+| 命令 | 说明 | 需 nvcc |
+|------|------|:-------:|
+| `make c` | 编译 4 个 C **CPU** 版本（`-O0 -g`），可移植性最好；`-O0` 即「纯标量 ~20 tok/s」基线 | 否 |
+| `make cfast` | 编译 4 个 C CPU 版本（`-Ofast -march=native`），当前 CPU 通常最快 | 否 |
+| `make ccuda` | 只编译 2 个 C **CUDA** 版本（`-O3 -arch=native`） | **是** |
+| `make test` | 编译并运行两个 GEMV 内核测试（`c/test_matmul.c`、`c/test_fp32.c`），CPU 支持才跑对应内核 | 否 |
+| `make z` | 编译全部 6 个 Zig 可执行文件（4 CPU + 2 CUDA），ReleaseFast | **是** |
+| `make zdebug` | 编译全部 6 个 Zig 可执行文件，Debug | **是** |
+| `make clean` | 清理 C 与 Zig 的编译产物 | 否 |
+
+> 无 GPU 服务器上：`make cfast && make crun && make test` 即可走完整个 CPU 加速旅程
+> （~200 → ~500 tok/s）。`ccuda`/`crunall`/`z`/`zrun` 需要 `nvcc`。
+> 想从 ~20 tok/s 的基线起步：先 `make c`（`-O0`），再 `make cfast` 对比。
+
+**复现「~20 tok/s 纯标量基线」**（`make c` 就是 `-O0`，编完直接跑）：
 
 ```
-gcc -O0 -o /tmp/llama2_cpu_scalar0 c/llama2_cpu.c -lm
-/tmp/llama2_cpu_scalar0 stories15M.bin     # → total N tokens, speed ~20 tok/s
+make c
+./c/llama2_cpu stories15M.bin           # → total N tokens, speed ~20 tok/s
 ```
 
 产物位置：
@@ -163,10 +171,11 @@ gcc -O0 -o /tmp/llama2_cpu_scalar0 c/llama2_cpu.c -lm
 
 ## 五、运行
 
-| 命令 | 说明 |
-|------|------|
-| `make crun` | 先 `make c`，依次跑 6 个 C 程序（两个 SIMD 版各按 scalar/avx2/avx512 三档内核再跑一遍） |
-| `make zrun` | 先 `make z`，依次跑 4 个 Zig CPU 程序（两个 SIMD 版各按 scalar/avx2/avx512 再跑一遍） |
+| 命令 | 说明 | 需 nvcc |
+|------|------|:-------:|
+| `make crun` | 先 `make cfast`，跑 4 个 C **CPU** 程序（两个 SIMD 版各按 scalar/avx2/avx512 三档内核再跑一遍） | 否 |
+| `make crunall` | 先 `make cfast ccuda`，跑全部 6 个 C 程序（= `crun` + 2 个 CUDA 版） | **是** |
+| `make zrun` | 先 `make z`，跑全部 6 个 Zig 程序（= 4 CPU + 2 CUDA，两个 SIMD 版各按 scalar/avx2/avx512 再跑一遍） | **是** |
 
 或直接执行产物：
 
