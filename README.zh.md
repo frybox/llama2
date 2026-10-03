@@ -19,7 +19,7 @@
 - **Zig 路线**（`zig/`）：用 Zig 复刻同样的四个 CPU 版本 + 两个 CUDA 版本，
   验证「同样的加速手段，用另一门语言也能拿到」。
 
-> 一句话结论：纯标量 ~20 tok/s；显式 SIMD 与 int8 量化把 CPU 推到 ~500 tok/s 量级；
+> 纯标量 ~20 tok/s；显式 SIMD 与 int8 量化把 CPU 推到 ~500 tok/s 量级；
 > 真正的 100 倍来自 GPU——CUDA fp32 ~2300、CUDA int8 ~2500+ tok/s。
 > Zig 路线逐版本对得上，量级几乎一致。
 

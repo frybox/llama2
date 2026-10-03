@@ -20,7 +20,7 @@ The repo contains **two parallel tracks**, running the same model and the same i
 - **Zig track** (`zig/`): re-implements the same four CPU versions + two CUDA versions in Zig,
   verifying that "the same acceleration levers pay off in another language too".
 
-> Bottom line in one sentence: pure scalar ~20 tok/s; explicit SIMD and int8 quantization push the CPU
+> pure scalar ~20 tok/s; explicit SIMD and int8 quantization push the CPU
 > to the ~500 tok/s range; the real 100× comes from the GPU — CUDA fp32 ~2300, CUDA int8 ~2500+ tok/s.
 > The Zig track matches version by version, at almost the same magnitudes.
 
