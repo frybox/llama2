@@ -16,9 +16,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
@@ -35,9 +33,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe_v);
     const run_v_cmd = b.addRunArtifact(exe_v);
     run_v_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_v_cmd.addArgs(args);
-    }
+    run_v_cmd.addPassthruArgs();
     const run_v_step = b.step("runv", "Run the SIMD app (mainv.zig)");
     run_v_step.dependOn(&run_v_cmd.step);
 
@@ -53,9 +49,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe_q);
     const run_q_cmd = b.addRunArtifact(exe_q);
     run_q_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_q_cmd.addArgs(args);
-    }
+    run_q_cmd.addPassthruArgs();
     const run_q_step = b.step("runq", "Run the quantized app (mainq.zig)");
     run_q_step.dependOn(&run_q_cmd.step);
 
@@ -92,9 +86,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe_qv);
     const run_qv_cmd = b.addRunArtifact(exe_qv);
     run_qv_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_qv_cmd.addArgs(args);
-    }
+    run_qv_cmd.addPassthruArgs();
     const run_qv_step = b.step("runqv", "Run the SIMD-quantized app (mainqv.zig)");
     run_qv_step.dependOn(&run_qv_cmd.step);
 

@@ -295,8 +295,8 @@ const State = struct {
   }
 
   fn deinit (self: *Self, allocator: Allocator) void {
-    inline for (std.meta.fields(Self)) |f| {
-      allocator.free(@field(self, f.name));
+    inline for (@typeInfo(Self).@"struct".field_names) |name| {
+      allocator.free(@field(self, name));
     }
     self.* = undefined;
   }
